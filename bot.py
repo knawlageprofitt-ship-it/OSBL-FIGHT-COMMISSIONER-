@@ -450,7 +450,7 @@ async def result(ctx, *, details: str = None):
             "`!result Baybe Mama | Kayoski | 2-1`"
         )
         return
-            parts = [part.strip() for part in details.split("|")]
+    parts = [part.strip() for part in details.split("|")]
 
     if len(parts) != 3:
         await ctx.send(
