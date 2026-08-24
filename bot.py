@@ -710,6 +710,187 @@ async def setrank(ctx, *, details: str = None):
     )
 
     await ctx.send(embed=embed)
+
+# ============================================
+# RECORD CHAMPIONSHIP RESULT
+# FORMAT:
+# !champresult Winner | Loser | Score
+# ============================================
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def champresult(ctx, *, details: str = None):
+
+    if not details:
+        await ctx.send(
+            "❌ **CHAMPIONSHIP RESULT FORMAT**\n"
+            "`!champresult Winner | Loser | Score`\n"
+            "Example:\n"
+            "`!champresult Test Champ One | Test Champ Two | 3-1`"
+        )
+        return
+
+    parts = [part.strip() for part in details.split("|")]
+
+    if len(parts) != 3:
+        await ctx.send(
+            "❌ Use exactly this format:\n"
+            "`!champresult Winner | Loser | Score`"
+        )
+        return
+
+    winner_name, loser_name, score = parts
+
+    if score not in ("3-0", "3-1", "3-2"):
+        await ctx.send(
+            "❌ Championship score must be **3-0, 3-1, or 3-2**."
+        )
+        return
+
+    winner_key = winner_name.casefold()
+    loser_key = loser_name.casefold()
+
+    winner = await bot.db.fetchrow(
+        """
+        SELECT *
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        winner_key
+    )
+
+    loser = await bot.db.fetchrow(
+        """
+        SELECT *
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        loser_key
+    )
+
+    if not winner:
+        await ctx.send(f"❌ **{winner_name}** is not registered in OSBL.")
+        return
+
+    if not loser:
+        await ctx.send(f"❌ **{loser_name}** is not registered in OSBL.")
+        return
+
+    if winner["division"] != loser["division"]:
+        await ctx.send("❌ Fighters must be in the same division.")
+        return
+
+    winner_rp_gain = 20
+    loser_rp_gain = 5
+    bonuses = []
+
+    if score == "3-0":
+        winner_rp_gain += 5
+        bonuses.append("🧹 3-0 Championship Sweep: +5 RP")
+
+    defending_champion = bool(winner["champion"])
+
+    if defending_champion:
+        winner_rp_gain += 15
+        bonuses.append("🛡️ Successful Title Defense: +15 RP")
+
+    new_winner_rp = winner["rp"] + winner_rp_gain
+    new_loser_rp = loser["rp"] + loser_rp_gain
+
+    def progression_for(rp):
+        if rp >= 140:
+            return "#1 Contender"
+        elif rp >= 110:
+            return "Elite Contender"
+        elif rp >= 80:
+            return "Top Contender"
+        elif rp >= 50:
+            return "Contender"
+        elif rp >= 25:
+            return "Rising Prospect"
+        else:
+            return "Prospect"
+
+    winner_progression = progression_for(new_winner_rp)
+    loser_progression = progression_for(new_loser_rp)
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET wins = wins + 1,
+                    rp = $1,
+                    progression_rank = $2,
+                    champion = TRUE,
+                    title_defenses = title_defenses + $3,
+                    updated_at = NOW()
+                WHERE fighter_key = $4
+                """,
+                new_winner_rp,
+                winner_progression,
+                1 if defending_champion else 0,
+                winner_key
+            )
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET losses = losses + 1,
+                    rp = $1,
+                    progression_rank = $2,
+                    champion = FALSE,
+                    updated_at = NOW()
+                WHERE fighter_key = $3
+                """,
+                new_loser_rp,
+                loser_progression,
+                loser_key
+            )
+
+    bonuses_text = "\n".join(bonuses) if bonuses else "None"
+
+    embed = discord.Embed(
+        title="🏆 OSBL OFFICIAL CHAMPIONSHIP RESULT",
+        description=f"**{winner['division']} Championship**",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="👑 Champion",
+        value=(
+            f"**{winner['fighter_name']}**\n"
+            f"Score: **{score}**\n"
+            f"Record: **{winner['wins'] + 1}-{winner['losses']}**\n"
+            f"RP: **{new_winner_rp}** (+{winner_rp_gain})\n"
+            f"Progression: **{winner_progression}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🥊 Opponent",
+        value=(
+            f"**{loser['fighter_name']}**\n"
+            f"Record: **{loser['wins']}-{loser['losses'] + 1}**\n"
+            f"RP: **{new_loser_rp}** (+{loser_rp_gain})\n"
+            f"Progression: **{loser_progression}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⭐ Championship Bonuses",
+        value=bonuses_text,
+        inline=False
+    )
+
+    embed.set_footer(
+        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
