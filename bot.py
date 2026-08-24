@@ -613,7 +613,103 @@ async def result(ctx, *, details: str = None):
         text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
     )
 
-    await ctx.send(embed=embed)            
+    await ctx.send(embed=embed)   
+
+# ============================================
+# SET DIVISION RANK
+# FORMAT:
+# !setrank Fighter Name | Rank
+# ============================================
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def setrank(ctx, *, details: str = None):
+
+    if not details:
+        await ctx.send(
+            "❌ **SET RANK FORMAT**\n"
+            "`!setrank Fighter Name | Rank`\n"
+            "Example:\n"
+            "`!setrank Test Fighter Four | 5`"
+        )
+        return
+
+    parts = [part.strip() for part in details.split("|")]
+
+    if len(parts) != 2:
+        await ctx.send(
+            "❌ Use exactly this format:\n"
+            "`!setrank Fighter Name | Rank`"
+        )
+        return
+
+    fighter_name, rank_text = parts
+    fighter_key = fighter_name.casefold()
+
+    try:
+        rank = int(rank_text)
+    except ValueError:
+        await ctx.send("❌ Rank must be a number.")
+        return
+
+    if rank < 1 or rank > 25:
+        await ctx.send("❌ Rank must be between 1 and 25.")
+        return
+
+    fighter = await bot.db.fetchrow(
+        """
+        SELECT *
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        fighter_key
+    )
+
+    if not fighter:
+        await ctx.send(
+            f"❌ **{fighter_name}** is not registered in OSBL."
+        )
+        return
+
+    await bot.db.execute(
+        """
+        UPDATE fighters
+        SET division_rank = $1,
+            updated_at = NOW()
+        WHERE fighter_key = $2
+        """,
+        rank,
+        fighter_key
+    )
+
+    embed = discord.Embed(
+        title="🥊 OSBL DIVISION RANK UPDATED",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="🥊 Fighter",
+        value=fighter["fighter_name"],
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚖️ Division",
+        value=fighter["division"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="🏅 New Ranking",
+        value=f"#{rank}",
+        inline=True
+    )
+
+    embed.set_footer(
+        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
