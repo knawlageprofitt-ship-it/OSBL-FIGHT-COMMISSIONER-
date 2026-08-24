@@ -655,6 +655,54 @@ async def result(ctx, *, details: str = None):
     async with bot.db.acquire() as conn:
         async with conn.transaction():
 
+           await conn.execute(
+            """
+            INSERT INTO fight_history (
+                fight_type,
+                winner_key,
+                loser_key,
+                score,
+                winner_rp_before,
+                loser_rp_before,
+                winner_wins_before,
+                winner_losses_before,
+                loser_wins_before,
+                loser_losses_before,
+                winner_earnings_before,
+                loser_earnings_before,
+                winner_champion_before,
+                loser_champion_before,
+                winner_title_defenses_before,
+                loser_title_defenses_before
+            )
+            VALUES (
+                'regular',
+                $1, $2, $3,
+                $4, $5,
+                $6, $7,
+                $8, $9,
+                $10, $11,
+                $12, $13,
+                $14, $15
+            )
+            """,
+            winner_key,
+            loser_key,
+            score,
+            winner["rp"],
+            loser["rp"],
+            winner["wins"],
+            winner["losses"],
+            loser["wins"],
+            loser["losses"],
+            winner["career_earnings"],
+            loser["career_earnings"],
+            winner["champion"],
+            loser["champion"],
+            winner["title_defenses"],
+            loser["title_defenses"]
+        )
+
             await conn.execute(
     """
     UPDATE fighters
