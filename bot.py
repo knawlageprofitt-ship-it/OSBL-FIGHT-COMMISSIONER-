@@ -57,6 +57,36 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fight_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    fight_type TEXT NOT NULL,
+                    winner_key TEXT NOT NULL,
+                    loser_key TEXT NOT NULL,
+                    score TEXT NOT NULL,
+
+                    winner_rp_before INTEGER NOT NULL,
+                    loser_rp_before INTEGER NOT NULL,
+
+                    winner_wins_before INTEGER NOT NULL,
+                    winner_losses_before INTEGER NOT NULL,
+                    loser_wins_before INTEGER NOT NULL,
+                    loser_losses_before INTEGER NOT NULL,
+
+                    winner_earnings_before BIGINT NOT NULL,
+                    loser_earnings_before BIGINT NOT NULL,
+
+                    winner_champion_before BOOLEAN NOT NULL,
+                    loser_champion_before BOOLEAN NOT NULL,
+
+                    winner_title_defenses_before INTEGER NOT NULL,
+                    loser_title_defenses_before INTEGER NOT NULL,
+
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    undone BOOLEAN NOT NULL DEFAULT FALSE
+                );
+            """)
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
