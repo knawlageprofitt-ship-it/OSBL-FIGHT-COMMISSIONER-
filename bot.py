@@ -1104,13 +1104,22 @@ async def rankings(ctx, *, division: str = None):
     if fighters:
         ranking_lines = []
 
-        for fighter in fighters:
-            ranking_lines.append(
-                f"**#{fighter['division_rank']} — {fighter['fighter_name']}**\n"
-                f"Record: {fighter['wins']}-{fighter['losses']} | "
-                f"RP: {fighter['rp']} | "
-                f"{fighter['progression_rank']}"
-            )
+    for fighter in fighters:
+
+    title_eligibility = (
+        "🏆 TITLE ELIGIBLE"
+        if fighter["rp"] >= 140
+        else "🔒 Not Yet Title Eligible"
+    )
+
+    ranking_lines.append(
+        f"**#{fighter['division_rank']} — {fighter['fighter_name']}**\n"
+        f"🏢 Gym: **{fighter['gym']}**\n"
+        f"🥊 Record: **{fighter['wins']}-{fighter['losses']}**\n"
+        f"💎 RP: **{fighter['rp']}**\n"
+        f"📈 Progression: **{fighter['progression_rank']}**\n"
+        f"{title_eligibility}"
+    )
 
         embed.add_field(
             name="🏅 CONTENDER RANKINGS",
