@@ -72,6 +72,26 @@ bot = OSBLBot(
     help_command=None
 )
 
+def get_regular_purse(progression_rank, won=False):
+    purses = {
+        "Prospect": (50000, 25000),
+        "Rising Prospect": (75000, 35000),
+        "Contender": (100000, 50000),
+        "Top Contender": (150000, 75000),
+        "Elite Contender": (225000, 100000),
+        "#1 Contender": (350000, 150000),
+    }
+
+    show_purse, win_bonus = purses.get(
+        progression_rank,
+        (50000, 25000)
+    )
+
+    if won:
+        return show_purse + win_bonus
+
+    return show_purse
+
 async def update_division_rankings(division):
     rows = await bot.db.fetch(
         """
