@@ -897,7 +897,7 @@ async def champresult(ctx, *, details: str = None):
                 loser_key
             )
             
-await update_division_rankings(winner["division"])
+    await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
     embed = discord.Embed(
