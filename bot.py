@@ -570,6 +570,8 @@ async def result(ctx, *, details: str = None):
                 """,
                 new_loser_rp,
                 loser_progression,
+                loser_key
+            )
         bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
     embed = discord.Embed(
