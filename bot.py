@@ -1113,11 +1113,11 @@ async def rankings(ctx, *, division: str = None):
     for fighter in fighters
 ]
 
-embed.add_field(
+    embed.add_field(
     name="🥇 CONTENDER RANKINGS",
     value="\n\n".join(ranking_lines) if ranking_lines else "No ranked contenders yet.",
     inline=False
-)
+    )
 
     
 
