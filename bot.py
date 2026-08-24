@@ -72,7 +72,53 @@ bot = OSBLBot(
     help_command=None
 )
 
+async def update_division_rankings(division):
+    rows = await bot.db.fetch(
+        """
+        SELECT fighter_key, fighter_name, wins, losses, rp, champion
+        FROM fighters
+        WHERE division = $1
+        ORDER BY
+            champion DESC,
+            rp DESC,
+            wins DESC,
+            losses ASC,
+            fighter_name ASC
+        """,
+        division
+    )
 
+    contender_rank = 1
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+
+            for row in rows:
+
+                if row["champion"]:
+                    await conn.execute(
+                        """
+                        UPDATE fighters
+                        SET division_rank = NULL,
+                            updated_at = NOW()
+                        WHERE fighter_key = $1
+                        """,
+                        row["fighter_key"]
+                    )
+
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE fighters
+                        SET division_rank = $1,
+                            updated_at = NOW()
+                        WHERE fighter_key = $2
+                        """,
+                        contender_rank,
+                        row["fighter_key"]
+                    )
+
+                    contender_rank += 1
 # =========================================================
 # READY EVENT
 # =========================================================
@@ -572,6 +618,8 @@ async def result(ctx, *, details: str = None):
                 loser_progression,
                 loser_key
             )
+
+        await update_division_rankings(winner["division"])
         bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
     embed = discord.Embed(
@@ -848,7 +896,8 @@ async def champresult(ctx, *, details: str = None):
                 loser_progression,
                 loser_key
             )
-
+            
+await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
     embed = discord.Embed(
@@ -950,6 +999,120 @@ async def champions(ctx):
                 value="**VACANT**",
                 inline=False
             )
+
+    embed.set_footer(
+        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+    )
+
+    await ctx.send(embed=embed)
+
+# ============================================
+# OSBL DIVISION RANKINGS
+# FORMAT:
+# !rankings Lightweight
+# !rankings Middleweight
+# !rankings Heavyweight
+# ============================================
+
+@bot.command()
+async def rankings(ctx, *, division: str = None):
+
+    if not division:
+        await ctx.send(
+            "❌ Use:\n"
+            "`!rankings Lightweight`\n"
+            "`!rankings Middleweight`\n"
+            "`!rankings Heavyweight`"
+        )
+        return
+
+    divisions = {
+        "lightweight": "Lightweight",
+        "middleweight": "Middleweight",
+        "heavyweight": "Heavyweight"
+    }
+
+    division_key = division.lower().strip()
+
+    if division_key not in divisions:
+        await ctx.send(
+            "❌ Division must be **Lightweight, Middleweight, or Heavyweight**."
+        )
+        return
+
+    official_division = divisions[division_key]
+
+    await update_division_rankings(official_division)
+
+    champion = await bot.db.fetchrow(
+        """
+        SELECT *
+        FROM fighters
+        WHERE division = $1
+          AND champion = TRUE
+        LIMIT 1
+        """,
+        official_division
+    )
+
+    fighters = await bot.db.fetch(
+        """
+        SELECT *
+        FROM fighters
+        WHERE division = $1
+          AND champion = FALSE
+        ORDER BY division_rank ASC
+        """,
+        official_division
+    )
+
+    embed = discord.Embed(
+        title=f"🥊 OSBL {official_division.upper()} RANKINGS",
+        description="Official ONESTATE Boxing League division standings",
+        color=discord.Color.gold()
+    )
+
+    if champion:
+        embed.add_field(
+            name="👑 CHAMPION",
+            value=(
+                f"**{champion['fighter_name']}**\n"
+                f"Record: **{champion['wins']}-{champion['losses']}**\n"
+                f"RP: **{champion['rp']}**\n"
+                f"Title Defenses: **{champion['title_defenses']}**"
+            ),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="👑 CHAMPION",
+            value="**VACANT**",
+            inline=False
+        )
+
+    if fighters:
+        ranking_lines = []
+
+        for fighter in fighters:
+            ranking_lines.append(
+                f"**#{fighter['division_rank']} — {fighter['fighter_name']}**\n"
+                f"Record: {fighter['wins']}-{fighter['losses']} | "
+                f"RP: {fighter['rp']} | "
+                f"{fighter['progression_rank']}"
+            )
+
+        embed.add_field(
+            name="🏅 CONTENDER RANKINGS",
+            value="\n\n".join(ranking_lines),
+            inline=False
+        )
+
+    else:
+        embed.add_field(
+            name="🏅 CONTENDER RANKINGS",
+            value="No ranked contenders yet.",
+            inline=False
+        )
 
     embed.set_footer(
         text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
