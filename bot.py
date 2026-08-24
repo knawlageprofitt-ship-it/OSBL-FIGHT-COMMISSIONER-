@@ -1102,7 +1102,7 @@ async def rankings(ctx, *, division: str = None):
         )
 
     if fighters:
-    ranking_lines = []
+        ranking_lines = []
 
     for fighter in fighters:
         title_eligibility = (
