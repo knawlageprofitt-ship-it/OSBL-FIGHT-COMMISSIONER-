@@ -621,21 +621,21 @@ async def result(ctx, *, details: str = None):
     winner_key
 )
 
-           await conn.execute(
-    """
-    UPDATE fighters
-    SET losses = losses + 1,
-        rp = $1,
-        progression_rank = $2,
-        career_earnings = career_earnings + $3,
-        updated_at = NOW()
-    WHERE fighter_key = $4
-    """,
-       new_loser_rp,
-       loser_progression,
-       loser_purse,
-       loser_key
-   )
+            await conn.execute(
+            """
+            UPDATE fighters
+            SET losses = losses + 1,
+                rp = $1,
+                progression_rank = $2,
+                career_earnings = career_earnings + $3,
+                updated_at = NOW()
+            WHERE fighter_key = $4
+            """,
+            new_loser_rp,
+            loser_progression,
+            loser_purse,
+            loser_key
+        )
 
     await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
