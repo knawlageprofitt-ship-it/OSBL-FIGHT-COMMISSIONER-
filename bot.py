@@ -1108,16 +1108,16 @@ async def rankings(ctx, *, division: str = None):
         f"🥊 Record: **{fighter['wins']}-{fighter['losses']}**\n"
         f"💎 RP: **{fighter['rp']}**\n"
         f"📈 Progression: **{fighter['progression_rank']}**\n"
-        f"{'🏆 TITLE ELIGIBLE' if fighter['rp'] >= 140 else '🔒 Not Yet Title Eligible'}"
+        f"{'🏆 TITLE ELIGIBLE' if fighter['rp'] >= 140 else '🔒 ' + str(140 - fighter['rp']) + ' RP away from Title Eligibility'}"
     )
     for fighter in fighters
-    ]
+]
 
-    embed.add_field(
-        name="🥇 CONTENDER RANKINGS",
-        value="\n\n".join(ranking_lines) if ranking_lines else "No ranked contenders yet.",
-        inline=False
-    )
+embed.add_field(
+    name="🥇 CONTENDER RANKINGS",
+    value="\n\n".join(ranking_lines) if ranking_lines else "No ranked contenders yet.",
+    inline=False
+)
 
     
 
