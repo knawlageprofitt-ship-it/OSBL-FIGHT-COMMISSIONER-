@@ -1121,7 +1121,7 @@ async def rankings(ctx, *, division: str = None):
         f"{title_eligibility}"
     )
 
-        embed.add_field(
+    embed.add_field(
             name="🏅 CONTENDER RANKINGS",
             value="\n\n".join(ranking_lines),
             inline=False
