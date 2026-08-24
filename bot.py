@@ -562,6 +562,9 @@ async def result(ctx, *, details: str = None):
         )
         return
 
+    winner_purse = get_regular_purse(winner["progression_rank"], won=True)
+    loser_purse = get_regular_purse(loser["progression_rank"], won=False)
+
     winner_rp_gain = 10
     loser_rp_gain = 2
     bonuses = []
@@ -603,32 +606,36 @@ async def result(ctx, *, details: str = None):
         async with conn.transaction():
 
             await conn.execute(
-                """
-                UPDATE fighters
-                SET wins = wins + 1,
-                    rp = $1,
-                    progression_rank = $2,
-                    updated_at = NOW()
-                WHERE fighter_key = $3
-                """,
-                new_winner_rp,
-                winner_progression,
-                winner_key
-            )
+    """
+    UPDATE fighters
+    SET wins = wins + 1,
+        rp = $1,
+        progression_rank = $2,
+        career_earnings = career_earnings + $3,
+        updated_at = NOW()
+    WHERE fighter_key = $4
+    """,
+    new_winner_rp,
+    winner_progression,
+    winner_purse,
+    winner_key
+)
 
-            await conn.execute(
-                """
-                UPDATE fighters
-                SET losses = losses + 1,
-                    rp = $1,
-                    progression_rank = $2,
-                    updated_at = NOW()
-                WHERE fighter_key = $3
-                """,
-                new_loser_rp,
-                loser_progression,
-                loser_key
-            )
+    await conn.execute(
+    """
+    UPDATE fighters
+    SET losses = losses + 1,
+        rp = $1,
+        progression_rank = $2,
+        career_earnings = career_earnings + $3,
+        updated_at = NOW()
+    WHERE fighter_key = $4
+    """,
+    new_loser_rp,
+    loser_progression,
+    loser_purse,
+    loser_key
+)
 
         await update_division_rankings(winner["division"])
         bonuses_text = "\n".join(bonuses) if bonuses else "None"
@@ -647,6 +654,8 @@ async def result(ctx, *, details: str = None):
             f"Record: **{winner['wins'] + 1}-{winner['losses']}**\n"
             f"RP: **{new_winner_rp}** (+{winner_rp_gain})\n"
             f"Progression: **{winner_progression}**"
+            f"💰 Fight Purse: **${winner_purse:,}**\n"
+            f"💵 Career Earnings: **${winner['career_earnings'] + winner_purse:,}**"
         ),
         inline=False
     )
@@ -657,7 +666,9 @@ async def result(ctx, *, details: str = None):
             f"**{loser['fighter_name']}**\n"
             f"Record: **{loser['wins']}-{loser['losses'] + 1}**\n"
             f"RP: **{new_loser_rp}** (+{loser_rp_gain})\n"
-            f"Progression: **{loser_progression}**"
+            f"Progression: **{loser_progression}**\n"
+            f"💰 Fight Purse: **${loser_purse:,}**\n"
+            f"💵 Career Earnings: **${loser['career_earnings'] + loser_purse:,}**"
         ),
         inline=False
     )
