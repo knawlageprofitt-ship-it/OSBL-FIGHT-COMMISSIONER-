@@ -312,6 +312,17 @@ async def fighter(ctx, *, fighter_name: str = None):
         )
         return
 
+    await update_division_rankings(row["division"])
+
+    row = await bot.db.fetchrow(
+    """
+    SELECT *
+    FROM fighters
+    WHERE fighter_key = $1
+    """,
+    fighter_key
+)
+
     title_status = (
         "👑 CHAMPION"
         if row["champion"]
