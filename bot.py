@@ -891,6 +891,71 @@ async def champresult(ctx, *, details: str = None):
     )
 
     await ctx.send(embed=embed)
+
+# ============================================
+# CURRENT OSBL CHAMPIONS
+# FORMAT:
+# !champions
+# ============================================
+
+@bot.command()
+async def champions(ctx):
+
+    divisions = ["Lightweight", "Middleweight", "Heavyweight"]
+
+    embed = discord.Embed(
+        title="🏆 OSBL CURRENT CHAMPIONS",
+        description="Official ONESTATE Boxing League titleholders",
+        color=discord.Color.gold()
+    )
+
+    for division in divisions:
+
+        champion = await bot.db.fetchrow(
+            """
+            SELECT *
+            FROM fighters
+            WHERE division = $1
+              AND champion = TRUE
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            division
+        )
+
+        if champion:
+            ranking = (
+                f"#{champion['division_rank']}"
+                if champion["division_rank"]
+                else "Unranked"
+            )
+
+            embed.add_field(
+                name=f"👑 {division} Champion",
+                value=(
+                    f"**{champion['fighter_name']}**\n"
+                    f"Gym: **{champion['gym']}**\n"
+                    f"Record: **{champion['wins']}-{champion['losses']}**\n"
+                    f"RP: **{champion['rp']}**\n"
+                    f"Progression: **{champion['progression_rank']}**\n"
+                    f"Division Ranking: **{ranking}**\n"
+                    f"Title Defenses: **{champion['title_defenses']}**"
+                ),
+                inline=False
+            )
+
+        else:
+            embed.add_field(
+                name=f"👑 {division} Champion",
+                value="**VACANT**",
+                inline=False
+            )
+
+    embed.set_footer(
+        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
