@@ -962,7 +962,7 @@ async def champresult(ctx, *, details: str = None):
             f"Score: **{score}**\n"
             f"Record: **{winner['wins'] + 1}-{winner['losses']}**\n"
             f"RP: **{new_winner_rp}** (+{winner_rp_gain})\n"
-            f"Progression: **{winner_progression}**"
+            f"Progression: **{winner_progression}**\n"
             f"💰 Fight Purse: **${winner_purse:,}**\n"
             f"💵 Career Earnings: **${winner['career_earnings'] + winner_purse:,}**"
         ),
@@ -975,7 +975,7 @@ async def champresult(ctx, *, details: str = None):
             f"**{loser['fighter_name']}**\n"
             f"Record: **{loser['wins']}-{loser['losses'] + 1}**\n"
             f"RP: **{new_loser_rp}** (+{loser_rp_gain})\n"
-            f"Progression: **{loser_progression}**"
+            f"Progression: **{loser_progression}**\n"
             f"💰 Fight Purse: **${loser_purse:,}**\n"
             f"💵 Career Earnings: **${loser['career_earnings'] + loser_purse:,}**"
             
