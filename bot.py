@@ -703,9 +703,9 @@ async def result(ctx, *, details: str = None):
             loser["title_defenses"]
         )
 
-         await conn.execute(
-          """
-          UPDATE fighters
+           await conn.execute(
+            """
+            UPDATE fighters
     SET wins = wins + 1,
         rp = $1,
         progression_rank = $2,
@@ -719,8 +719,8 @@ async def result(ctx, *, details: str = None):
     winner_key
 )
 
-         await conn.execute(
-          """
+          await conn.execute(
+           """
           UPDATE fighters
      SET losses = losses + 1,
          rp = $1,
