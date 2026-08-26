@@ -719,8 +719,8 @@ async def result(ctx, *, details: str = None):
     winner_key
 )
 
-          await conn.execute(
-           """
+           await conn.execute(
+            """
           UPDATE fighters
      SET losses = losses + 1,
          rp = $1,
