@@ -1234,10 +1234,33 @@ async def rankings(ctx, *, division: str = None):
     for fighter in fighters
 ]
 
+    ranking_chunks = []
+current_chunk = ""
+
+for line in ranking_lines:
+    entry = line + "\n\n"
+
+    if len(current_chunk) + len(entry) > 1000:
+        ranking_chunks.append(current_chunk)
+        current_chunk = entry
+    else:
+        current_chunk += entry
+
+if current_chunk:
+    ranking_chunks.append(current_chunk)
+
+if ranking_chunks:
+    for i, chunk in enumerate(ranking_chunks):
+        embed.add_field(
+            name="🥇 CONTENDER RANKINGS" if i == 0 else "🥊 CONTENDER RANKINGS CONT.",
+            value=chunk,
+            inline=False
+        )
+else:
     embed.add_field(
-    name="🥇 CONTENDER RANKINGS",
-    value="\n\n".join(ranking_lines) if ranking_lines else "No ranked contenders yet.",
-    inline=False
+        name="🥇 CONTENDER RANKINGS",
+        value="No ranked contenders yet.",
+        inline=False
     )
 
     
