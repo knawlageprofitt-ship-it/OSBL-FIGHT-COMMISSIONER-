@@ -1234,7 +1234,7 @@ async def rankings(ctx, *, division: str = None):
     for fighter in fighters
 ]
 
-        ranking_chunks = []
+    ranking_chunks = []
     current_chunk = ""
 
     for line in ranking_lines:
