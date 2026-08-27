@@ -1316,6 +1316,184 @@ async def rankings(ctx, *, division: str = None):
     )
 
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def undoresult(ctx):
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+
+            fight = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_history
+                WHERE undone = FALSE
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """
+            )
+
+            if not fight:
+                await ctx.send("❌ **There are no fight results available to undo.**")
+                return
+
+            winner = await conn.fetchrow(
+                """
+                SELECT fighter_key, fighter_name, division
+                FROM fighters
+                WHERE fighter_key = $1
+                """,
+                fight["winner_key"]
+            )
+
+            loser = await conn.fetchrow(
+                """
+                SELECT fighter_key, fighter_name, division
+                FROM fighters
+                WHERE fighter_key = $1
+                """,
+                fight["loser_key"]
+            )
+
+            if not winner or not loser:
+                await ctx.send(
+                    "❌ **Undo failed: one of the fighters could not be found.**"
+                )
+                return
+
+            def progression_for(rp):
+                if rp >= 140:
+                    return "#1 Contender"
+                elif rp >= 110:
+                    return "Elite Contender"
+                elif rp >= 80:
+                    return "Top Contender"
+                elif rp >= 50:
+                    return "Contender"
+                elif rp >= 25:
+                    return "Rising Prospect"
+                else:
+                    return "Prospect"
+
+            winner_progression = progression_for(
+                fight["winner_rp_before"]
+            )
+
+            loser_progression = progression_for(
+                fight["loser_rp_before"]
+            )
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET wins = $1,
+                    losses = $2,
+                    rp = $3,
+                    progression_rank = $4,
+                    career_earnings = $5,
+                    champion = $6,
+                    title_defenses = $7,
+                    updated_at = NOW()
+                WHERE fighter_key = $8
+                """,
+                fight["winner_wins_before"],
+                fight["winner_losses_before"],
+                fight["winner_rp_before"],
+                winner_progression,
+                fight["winner_earnings_before"],
+                fight["winner_champion_before"],
+                fight["winner_title_defenses_before"],
+                fight["winner_key"]
+            )
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET wins = $1,
+                    losses = $2,
+                    rp = $3,
+                    progression_rank = $4,
+                    career_earnings = $5,
+                    champion = $6,
+                    title_defenses = $7,
+                    updated_at = NOW()
+                WHERE fighter_key = $8
+                """,
+                fight["loser_wins_before"],
+                fight["loser_losses_before"],
+                fight["loser_rp_before"],
+                loser_progression,
+                fight["loser_earnings_before"],
+                fight["loser_champion_before"],
+                fight["loser_title_defenses_before"],
+                fight["loser_key"]
+            )
+
+            await conn.execute(
+                """
+                UPDATE fight_history
+                SET undone = TRUE
+                WHERE id = $1
+                """,
+                fight["id"]
+            )
+
+    await update_division_rankings(winner["division"])
+
+    if loser["division"] != winner["division"]:
+        await update_division_rankings(loser["division"])
+
+    fight_type = (
+        "Championship Fight"
+        if fight["fight_type"] == "championship"
+        else "Regular Fight"
+    )
+
+    embed = discord.Embed(
+        title="↩️ OSBL RESULT UNDONE",
+        description=f"**{fight_type} has been officially reversed.**",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="🥊 Reversed Result",
+        value=(
+            f"**{winner['fighter_name']} vs {loser['fighter_name']}**\n"
+            f"Score: **{fight['score']}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🏆 Restored Fighter",
+        value=(
+            f"**{winner['fighter_name']}**\n"
+            f"Record: **{fight['winner_wins_before']}-"
+            f"{fight['winner_losses_before']}**\n"
+            f"RP: **{fight['winner_rp_before']}**\n"
+            f"Career Earnings: **${fight['winner_earnings_before']:,}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🥊 Restored Opponent",
+        value=(
+            f"**{loser['fighter_name']}**\n"
+            f"Record: **{fight['loser_wins_before']}-"
+            f"{fight['loser_losses_before']}**\n"
+            f"RP: **{fight['loser_rp_before']}**\n"
+            f"Career Earnings: **${fight['loser_earnings_before']:,}**"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="OSBL COMMISSIONER • OFFICIAL RESULT REVERSAL"
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
