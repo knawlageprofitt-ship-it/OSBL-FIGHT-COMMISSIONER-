@@ -87,6 +87,20 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS undo_audit_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    fight_history_id BIGINT NOT NULL,
+                    commissioner_id BIGINT NOT NULL,
+                    commissioner_name TEXT NOT NULL,
+                    fight_type TEXT NOT NULL,
+                    winner_key TEXT NOT NULL,
+                    loser_key TEXT NOT NULL,
+                    score TEXT NOT NULL,
+                    reversed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -1538,6 +1552,28 @@ async def confirmundo(ctx, fight_id: int):
                 """,
                 fight_id
             )
+
+            await conn.execute(
+                """
+                INSERT INTO undo_audit_log (
+                    fight_history_id,
+                    commissioner_id,
+                    commissioner_name,
+                    fight_type,
+                    winner_key,
+                    loser_key,
+                    score
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                fight_id,
+                ctx.author.id,
+                str(ctx.author),
+                fight["fight_type"],
+                fight["winner_key"],
+                fight["loser_key"],
+                fight["score"]
+    )
 
     await update_division_rankings(winner["division"])
 
