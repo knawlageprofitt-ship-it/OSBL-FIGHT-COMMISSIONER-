@@ -687,18 +687,18 @@ async def result(ctx, *, details: str = None):
     score
 )
 
-if duplicate:
-    await ctx.send(
-        f"⚠️ **POSSIBLE DUPLICATE RESULT**\n"
-        f"This fight appears to have already been recorded.\n"
-        f"History ID: **{duplicate['id']}**\n"
-        f"No records, RP, rankings, or payouts were changed."
-    )
-    return 
-  
- async with conn.transaction():
+    if duplicate:
+        await ctx.send(
+            f"⚠️ **POSSIBLE DUPLICATE RESULT**\n"
+            f"This fight appears to have already been recorded.\n"
+            f"History ID: **{duplicate['id']}**\n"
+            f"No records, RP, rankings, or payouts were changed."
+        )
+        return
 
-           await conn.execute(
+    async with conn.transaction():
+
+        await conn.execute(    
             """
             INSERT INTO fight_history (
                 fight_type,
