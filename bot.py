@@ -1321,21 +1321,121 @@ async def rankings(ctx, *, division: str = None):
 @commands.has_any_role("OSBL COMMISSIONER")
 async def undoresult(ctx):
     async with bot.db.acquire() as conn:
+        fight = await conn.fetchrow(
+            """
+            SELECT *
+            FROM fight_history
+            WHERE undone = FALSE
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+
+        if not fight:
+            await ctx.send(
+                "❌ **There are no fight results available to undo.**"
+            )
+            return
+
+        winner = await conn.fetchrow(
+            """
+            SELECT fighter_name
+            FROM fighters
+            WHERE fighter_key = $1
+            """,
+            fight["winner_key"]
+        )
+
+        loser = await conn.fetchrow(
+            """
+            SELECT fighter_name
+            FROM fighters
+            WHERE fighter_key = $1
+            """,
+            fight["loser_key"]
+        )
+
+    fight_type = (
+        "Championship Fight"
+        if fight["fight_type"] == "championship"
+        else "Regular Fight"
+    )
+
+    embed = discord.Embed(
+        title="⚠️ OSBL UNDO CONFIRMATION REQUIRED",
+        description=(
+            "**No changes have been made yet.**\n"
+            "Review this result before confirming."
+        ),
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="🥊 Result Selected",
+        value=(
+            f"Type: **{fight_type}**\n"
+            f"Winner: **{winner['fighter_name']}**\n"
+            f"Opponent: **{loser['fighter_name']}**\n"
+            f"Score: **{fight['score']}**"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔐 Confirmation",
+        value=(
+            f"Fight History ID: **{fight['id']}**\n\n"
+            f"To reverse this result, enter:\n"
+            f"`!confirmundo {fight['id']}`"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="OSBL COMMISSIONER • VERIFY BEFORE CONFIRMING"
+    )
+
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def confirmundo(ctx, fight_id: int):
+    async with bot.db.acquire() as conn:
         async with conn.transaction():
 
             fight = await conn.fetchrow(
                 """
                 SELECT *
                 FROM fight_history
-                WHERE undone = FALSE
-                ORDER BY id DESC
-                LIMIT 1
+                WHERE id = $1
+                  AND undone = FALSE
                 FOR UPDATE
-                """
+                """,
+                fight_id
             )
 
             if not fight:
-                await ctx.send("❌ **There are no fight results available to undo.**")
+                await ctx.send(
+                    "❌ **That fight cannot be undone. "
+                    "It may already have been reversed or the ID is invalid.**"
+                )
+                return
+
+            newest_fight = await conn.fetchval(
+                """
+                SELECT id
+                FROM fight_history
+                WHERE undone = FALSE
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+
+            if newest_fight != fight_id:
+                await ctx.send(
+                    "❌ **Safety lock: only the most recent active "
+                    "fight result can be undone.**"
+                )
                 return
 
             winner = await conn.fetchrow(
@@ -1436,7 +1536,7 @@ async def undoresult(ctx):
                 SET undone = TRUE
                 WHERE id = $1
                 """,
-                fight["id"]
+                fight_id
             )
 
     await update_division_rankings(winner["division"])
@@ -1460,7 +1560,8 @@ async def undoresult(ctx):
         name="🥊 Reversed Result",
         value=(
             f"**{winner['fighter_name']} vs {loser['fighter_name']}**\n"
-            f"Score: **{fight['score']}**"
+            f"Score: **{fight['score']}**\n"
+            f"History ID: **{fight_id}**"
         ),
         inline=False
     )
