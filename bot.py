@@ -1631,6 +1631,65 @@ async def confirmundo(ctx, fight_id: int):
     )
 
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def fighthistory(ctx, limit: int = 10):
+    limit = max(1, min(limit, 20))
+
+    async with bot.db.acquire() as conn:
+        fights = await conn.fetch(
+            """
+            SELECT
+                id,
+                fight_type,
+                winner_key,
+                loser_key,
+                score,
+                created_at,
+                undone
+            FROM fight_history
+            ORDER BY id DESC
+            LIMIT $1
+            """,
+            limit
+        )
+
+    if not fights:
+        await ctx.send("🥊 No official fight history has been recorded yet.")
+        return
+
+    embed = discord.Embed(
+        title="📜 OSBL OFFICIAL FIGHT HISTORY",
+        description=f"Showing the latest **{len(fights)}** recorded fights.",
+        color=discord.Color.gold()
+    )
+
+    for fight in fights:
+        status = "↩️ REVERSED" if fight["undone"] else "✅ OFFICIAL"
+
+        fight_type = (
+            "Championship Fight"
+            if fight["fight_type"] == "championship"
+            else "Regular Fight"
+        )
+
+        embed.add_field(
+            name=f"🥊 History ID #{fight['id']} • {status}",
+            value=(
+                f"**Type:** {fight_type}\n"
+                f"🏆 Winner: **{fight['winner_key']}**\n"
+                f"🥊 Opponent: **{fight['loser_key']}**\n"
+                f"📊 Score: **{fight['score']}**"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(
+        text="OSBL COMMISSIONER • OFFICIAL FIGHT LEDGER"
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
