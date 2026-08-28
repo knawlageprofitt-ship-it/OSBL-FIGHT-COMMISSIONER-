@@ -695,7 +695,8 @@ if duplicate:
         f"No records, RP, rankings, or payouts were changed."
     )
     return 
-        async with conn.transaction():
+  
+ async with conn.transaction():
 
            await conn.execute(
             """
