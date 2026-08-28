@@ -1769,6 +1769,66 @@ async def fighterhistory(ctx, *, fighter_name: str):
     )
 
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def undolog(ctx, limit: int = 10):
+    limit = max(1, min(limit, 20))
+
+    async with bot.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                fight_history_id,
+                commissioner_name,
+                fight_type,
+                winner_key,
+                loser_key,
+                score,
+                reversed_at
+            FROM undo_audit_log
+            ORDER BY reversed_at DESC
+            LIMIT $1
+            """,
+            limit
+        )
+
+    if not rows:
+        await ctx.send("↩️ No result reversals have been recorded yet.")
+        return
+
+    embed = discord.Embed(
+        title="↩️ OSBL OFFICIAL UNDO LOG",
+        description=f"Showing the latest **{len(rows)}** result reversals.",
+        color=discord.Color.gold()
+    )
+
+    for row in rows:
+        fight_type = (
+            "Championship Fight"
+            if row["fight_type"] == "championship"
+            else "Regular Fight"
+        )
+
+        reversed_time = row["reversed_at"].strftime("%Y-%m-%d %H:%M")
+
+        embed.add_field(
+            name=f"History ID #{row['fight_history_id']} • REVERSED",
+            value=(
+                f"**Type:** {fight_type}\n"
+                f"🥊 {row['winner_key']} vs {row['loser_key']}\n"
+                f"📊 Score: **{row['score']}**\n"
+                f"👤 Commissioner: **{row['commissioner_name']}**\n"
+                f"🕒 Reversed: **{reversed_time}**"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(
+        text="OSBL COMMISSIONER • OFFICIAL REVERSAL AUDIT LOG"
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
