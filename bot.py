@@ -1690,6 +1690,85 @@ async def fighthistory(ctx, limit: int = 10):
     )
 
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def fighterhistory(ctx, *, fighter_name: str):
+    async with bot.db.acquire() as conn:
+        fighter = await conn.fetchrow(
+            """
+            SELECT fighter_key, fighter_name
+            FROM fighters
+            WHERE LOWER(fighter_name) = LOWER($1)
+            """,
+            fighter_name
+        )
+
+        if not fighter:
+            await ctx.send(f"❌ Fighter not found: **{fighter_name}**")
+            return
+
+        fights = await conn.fetch(
+            """
+            SELECT
+                id,
+                fight_type,
+                winner_key,
+                loser_key,
+                score,
+                created_at,
+                undone
+            FROM fight_history
+            WHERE winner_key = $1 OR loser_key = $1
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            fighter["fighter_key"]
+        )
+
+    if not fights:
+        await ctx.send(
+            f"🥊 No fight history found for **{fighter['fighter_name']}**."
+        )
+        return
+
+    embed = discord.Embed(
+        title="🥊 OSBL FIGHTER HISTORY",
+        description=f"Official fight ledger for **{fighter['fighter_name']}**",
+        color=discord.Color.gold()
+    )
+
+    for fight in fights:
+        status = "↩️ REVERSED" if fight["undone"] else "✅ OFFICIAL"
+
+        fight_type = (
+            "Championship Fight"
+            if fight["fight_type"] == "championship"
+            else "Regular Fight"
+        )
+
+        if fight["winner_key"] == fighter["fighter_key"]:
+            result = "🏆 WIN"
+            opponent_key = fight["loser_key"]
+        else:
+            result = "🥊 LOSS"
+            opponent_key = fight["winner_key"]
+
+        embed.add_field(
+            name=f"History ID #{fight['id']} • {result} • {status}",
+            value=(
+                f"**Type:** {fight_type}\n"
+                f"Opponent: **{opponent_key}**\n"
+                f"📊 Score: **{fight['score']}**"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(
+        text="OSBL COMMISSIONER • OFFICIAL FIGHTER LEDGER"
+    )
+
+    await ctx.send(embed=embed)
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
