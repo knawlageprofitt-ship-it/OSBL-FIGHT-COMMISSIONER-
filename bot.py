@@ -1627,7 +1627,7 @@ async def confirmundo(ctx, fight_id: int):
     )
 
     embed.set_footer(
-        text=f"OSBL COMMISSIONER • Reversed by {ctx.author}"
+        text=f"OSBL COMMISSIONER • Reversed by {ctx.author.display_name}"
     )
 
     await ctx.send(embed=embed)
