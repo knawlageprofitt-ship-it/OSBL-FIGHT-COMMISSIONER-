@@ -668,7 +668,7 @@ async def result(ctx, *, details: str = None):
 
     async with bot.db.acquire() as conn:
 
-    async with conn.transaction():
+        async with conn.transaction():
 
         await conn.execute(    
             """
