@@ -670,7 +670,7 @@ async def result(ctx, *, details: str = None):
 
         async with conn.transaction():
 
-        await conn.execute(    
+           await conn.execute(    
             """
             INSERT INTO fight_history (
                 fight_type,
