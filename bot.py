@@ -667,10 +667,9 @@ async def result(ctx, *, details: str = None):
     loser_progression = progression_for(new_loser_rp)
 
     async with bot.db.acquire() as conn:
-
         async with conn.transaction():
 
-           await conn.execute(    
+           await conn.execute(
             """
             INSERT INTO fight_history (
                 fight_type,
@@ -718,7 +717,7 @@ async def result(ctx, *, details: str = None):
             loser["title_defenses"]
         )
 
-        await conn.execute(
+           await conn.execute(
             """
             UPDATE fighters
     SET wins = wins + 1,
@@ -734,7 +733,7 @@ async def result(ctx, *, details: str = None):
     winner_key
 )
 
-       await conn.execute(
+           await conn.execute(
             """
           UPDATE fighters
      SET losses = losses + 1,
