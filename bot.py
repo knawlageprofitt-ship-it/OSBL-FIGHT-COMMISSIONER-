@@ -101,6 +101,20 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS result_override_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    duplicate_history_id BIGINT NOT NULL,
+                    commissioner_id BIGINT NOT NULL,
+                    commissioner_name TEXT NOT NULL,
+                    fight_type TEXT NOT NULL,
+                    winner_key TEXT NOT NULL,
+                    loser_key TEXT NOT NULL,
+                    score TEXT NOT NULL,
+                    overridden_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -931,6 +945,8 @@ async def setrank(ctx, *, details: str = None):
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def champresult(ctx, *, details: str = None):
 
+    force_override = bool(getattr(ctx, "_osbl_force_champresult", False))
+
     if not details:
         await ctx.send(
             "❌ **CHAMPIONSHIP RESULT FORMAT**\n"
@@ -1048,12 +1064,13 @@ async def champresult(ctx, *, details: str = None):
     score
 )
 
-        if duplicate:
+        if duplicate and not force_override:
             await ctx.send(
                 f"⚠️ **POSSIBLE DUPLICATE CHAMPIONSHIP RESULT**\n"
                 f"This championship fight appears to have already been recorded.\n"
                 f"History ID: **{duplicate['id']}**\n"
-                f"No records, RP, rankings, titles, or payouts were changed."
+                f"No records, RP, rankings, titles, or payouts were changed.\n\n"
+                f"Commissioner override: `!forcechampresult Winner | Loser | Score`"
             )
             return
 
@@ -1142,6 +1159,28 @@ async def champresult(ctx, *, details: str = None):
                 loser_key
             )
 
+            if duplicate and force_override:
+                await conn.execute(
+                    """
+                    INSERT INTO result_override_log (
+                        duplicate_history_id,
+                        commissioner_id,
+                        commissioner_name,
+                        fight_type,
+                        winner_key,
+                        loser_key,
+                        score
+                    )
+                    VALUES ($1, $2, $3, 'championship', $4, $5, $6)
+                    """,
+                    duplicate["id"],
+                    ctx.author.id,
+                    str(ctx.author),
+                    winner_key,
+                    loser_key,
+                    score
+                )
+
     await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
@@ -1185,11 +1224,32 @@ async def champresult(ctx, *, details: str = None):
         inline=False
     )
 
+    if duplicate and force_override:
+        embed.add_field(
+            name="🛡️ Commissioner Duplicate Override",
+            value=(
+                f"Authorized by **{ctx.author.display_name}**\n"
+                f"Previous matching History ID: **{duplicate['id']}**"
+            ),
+            inline=False
+        )
+
     embed.set_footer(
         text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
     )
 
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def forcechampresult(ctx, *, details: str = None):
+    """Commissioner-only override for a legitimate duplicate championship result."""
+    ctx._osbl_force_champresult = True
+    try:
+        await champresult.callback(ctx, details=details)
+    finally:
+        ctx._osbl_force_champresult = False
+
 
 # ============================================
 # CURRENT OSBL CHAMPIONS
