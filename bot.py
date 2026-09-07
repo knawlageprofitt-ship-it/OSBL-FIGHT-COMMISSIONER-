@@ -1106,7 +1106,7 @@ async def champresult(ctx, *, details: str = None):
                 loser["title_defenses"]
             )
 
-    await conn.execute(
+        await conn.execute(
             """
             UPDATE fighters
             SET wins = wins + 1,
@@ -1125,7 +1125,7 @@ async def champresult(ctx, *, details: str = None):
             winner_key
         )
 
-   await conn.execute(
+        await conn.execute(
             """
             UPDATE fighters
             SET losses = losses + 1,
@@ -1141,7 +1141,7 @@ async def champresult(ctx, *, details: str = None):
             loser_purse,
             loser_key
         )
-            
+
     await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
 
