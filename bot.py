@@ -115,6 +115,27 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fight_night_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    started_by_id BIGINT NOT NULL,
+                    started_by_name TEXT NOT NULL,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    start_history_id BIGINT NOT NULL DEFAULT 0,
+                    ended_by_id BIGINT,
+                    ended_by_name TEXT,
+                    ended_at TIMESTAMPTZ,
+                    end_history_id BIGINT
+                );
+            """)
+
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_fight_night_session
+                ON fight_night_sessions ((status))
+                WHERE status = 'active';
+            """)
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -254,6 +275,7 @@ async def systemcheck(ctx):
         "fight_history",
         "undo_audit_log",
         "result_override_log",
+        "fight_night_sessions",
     ]
 
     try:
@@ -332,6 +354,9 @@ async def systemcheck(ctx):
         "undoresult",
         "confirmundo",
         "fighthistory",
+        "startfightnight",
+        "fightnightstatus",
+        "endfightnight",
     ]
 
     missing_commands = []
@@ -383,6 +408,252 @@ async def systemcheck(ctx):
         )
 
     embed.set_footer(text=f"Requested by {ctx.author.display_name} • Read-only diagnostic")
+    await ctx.send(embed=embed)
+
+
+# =========================================================
+# FIGHT NIGHT SESSION SYSTEM
+# Creates a clean event boundary without blocking normal results.
+# =========================================================
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def startfightnight(ctx):
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            active = await conn.fetchrow(
+                """
+                SELECT id, started_by_name, started_at
+                FROM fight_night_sessions
+                WHERE status = 'active'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """
+            )
+
+            if active:
+                await ctx.send(
+                    "⚠️ **FIGHT NIGHT ALREADY ACTIVE**\n"
+                    f"Session ID: **{active['id']}**\n"
+                    f"Started by: **{active['started_by_name']}**\n"
+                    "Use `!fightnightstatus` for the live session."
+                )
+                return
+
+            start_history_id = await conn.fetchval(
+                "SELECT COALESCE(MAX(id), 0) FROM fight_history"
+            )
+
+            session = await conn.fetchrow(
+                """
+                INSERT INTO fight_night_sessions (
+                    started_by_id,
+                    started_by_name,
+                    start_history_id
+                )
+                VALUES ($1, $2, $3)
+                RETURNING id, started_at
+                """,
+                ctx.author.id,
+                ctx.author.display_name,
+                start_history_id,
+            )
+
+    embed = discord.Embed(
+        title="🥊 OSBL FIGHT NIGHT — SESSION OPEN",
+        description="**OFFICIAL FIGHT NIGHT IS NOW ACTIVE**",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Session ID", value=str(session["id"]), inline=True)
+    embed.add_field(name="Opened By", value=ctx.author.display_name, inline=True)
+    embed.add_field(
+        name="Starting Ledger Point",
+        value=f"History ID **{start_history_id}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="Commissioner Commands",
+        value="`!fightnightstatus` • `!endfightnight`",
+        inline=False,
+    )
+    embed.set_footer(text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def fightnightstatus(ctx):
+    async with bot.db.acquire() as conn:
+        session = await conn.fetchrow(
+            """
+            SELECT *
+            FROM fight_night_sessions
+            WHERE status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+
+        if not session:
+            await ctx.send(
+                "⚫ **NO ACTIVE FIGHT NIGHT SESSION**\n"
+                "A commissioner can open one with `!startfightnight`."
+            )
+            return
+
+        stats = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
+                COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights,
+                COUNT(*) FILTER (
+                    WHERE undone = FALSE AND fight_type = 'regular'
+                ) AS regular_fights,
+                COUNT(*) FILTER (
+                    WHERE undone = FALSE AND fight_type = 'championship'
+                ) AS championship_fights
+            FROM fight_history
+            WHERE id > $1
+            """,
+            session["start_history_id"],
+        )
+
+        override_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM result_override_log
+            WHERE overridden_at >= $1
+            """,
+            session["started_at"],
+        )
+
+    embed = discord.Embed(
+        title="📡 OSBL FIGHT NIGHT STATUS",
+        description="🟢 **SESSION ACTIVE**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Session ID", value=str(session["id"]), inline=True)
+    embed.add_field(name="Opened By", value=session["started_by_name"], inline=True)
+    embed.add_field(
+        name="🥊 Live Fight Count",
+        value=(
+            f"Official: **{stats['official_fights']}**\n"
+            f"Regular: **{stats['regular_fights']}**\n"
+            f"Championship: **{stats['championship_fights']}**\n"
+            f"Reversed: **{stats['reversed_fights']}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Commissioner Overrides",
+        value=f"**{override_count}** logged during this session",
+        inline=False,
+    )
+    embed.set_footer(text="Live read-only Fight Night session status")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def endfightnight(ctx):
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            session = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_night_sessions
+                WHERE status = 'active'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """
+            )
+
+            if not session:
+                await ctx.send(
+                    "⚠️ **NO ACTIVE FIGHT NIGHT SESSION**\n"
+                    "There is nothing to close."
+                )
+                return
+
+            end_history_id = await conn.fetchval(
+                "SELECT COALESCE(MAX(id), 0) FROM fight_history"
+            )
+
+            stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
+                    COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights,
+                    COUNT(*) FILTER (
+                        WHERE undone = FALSE AND fight_type = 'regular'
+                    ) AS regular_fights,
+                    COUNT(*) FILTER (
+                        WHERE undone = FALSE AND fight_type = 'championship'
+                    ) AS championship_fights
+                FROM fight_history
+                WHERE id > $1
+                  AND id <= $2
+                """,
+                session["start_history_id"],
+                end_history_id,
+            )
+
+            override_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM result_override_log
+                WHERE overridden_at >= $1
+                  AND overridden_at <= NOW()
+                """,
+                session["started_at"],
+            )
+
+            closed = await conn.fetchrow(
+                """
+                UPDATE fight_night_sessions
+                SET status = 'closed',
+                    ended_by_id = $1,
+                    ended_by_name = $2,
+                    ended_at = NOW(),
+                    end_history_id = $3
+                WHERE id = $4
+                RETURNING ended_at
+                """,
+                ctx.author.id,
+                ctx.author.display_name,
+                end_history_id,
+                session["id"],
+            )
+
+    embed = discord.Embed(
+        title="🔒 OSBL FIGHT NIGHT — SESSION CLOSED",
+        description="**OFFICIAL FIGHT NIGHT HAS ENDED**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Session ID", value=str(session["id"]), inline=True)
+    embed.add_field(name="Opened By", value=session["started_by_name"], inline=True)
+    embed.add_field(name="Closed By", value=ctx.author.display_name, inline=True)
+    embed.add_field(
+        name="📊 Final Fight Night Recap",
+        value=(
+            f"Official Fights: **{stats['official_fights']}**\n"
+            f"Regular Fights: **{stats['regular_fights']}**\n"
+            f"Championship Fights: **{stats['championship_fights']}**\n"
+            f"Reversed Results: **{stats['reversed_fights']}**\n"
+            f"Commissioner Overrides: **{override_count}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Ledger Range",
+        value=(
+            f"Started after History ID **{session['start_history_id']}**\n"
+            f"Closed at History ID **{end_history_id}**"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Fight Night session archived in the OSBL database")
     await ctx.send(embed=embed)
 
 
