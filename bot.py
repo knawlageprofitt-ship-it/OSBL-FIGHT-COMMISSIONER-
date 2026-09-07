@@ -238,6 +238,155 @@ async def osbl(ctx):
 
 
 # =========================================================
+# SYSTEM HEALTH CHECK
+# Commissioner-only, read-only diagnostic
+# =========================================================
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def systemcheck(ctx):
+    checks = []
+    warnings = []
+
+    # Database connectivity + required tables
+    required_tables = [
+        "fighters",
+        "fight_history",
+        "undo_audit_log",
+        "result_override_log",
+    ]
+
+    try:
+        async with bot.db.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+            checks.append("✅ Database connection")
+
+            table_rows = await conn.fetch(
+                """
+                SELECT tablename
+                FROM pg_catalog.pg_tables
+                WHERE schemaname = 'public'
+                  AND tablename = ANY($1::text[])
+                """,
+                required_tables,
+            )
+            existing_tables = {row["tablename"] for row in table_rows}
+
+            for table in required_tables:
+                if table in existing_tables:
+                    checks.append(f"✅ Table: `{table}`")
+                else:
+                    warnings.append(f"❌ Missing table: `{table}`")
+
+            fighter_count = await conn.fetchval("SELECT COUNT(*) FROM fighters")
+            active_fights = await conn.fetchval(
+                "SELECT COUNT(*) FROM fight_history WHERE undone = FALSE"
+            )
+            reversed_fights = await conn.fetchval(
+                "SELECT COUNT(*) FROM fight_history WHERE undone = TRUE"
+            )
+            override_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM result_override_log"
+            )
+
+            # Champion integrity: zero or one champion per division is valid.
+            champion_rows = await conn.fetch(
+                """
+                SELECT division, COUNT(*) AS champion_count
+                FROM fighters
+                WHERE champion = TRUE
+                GROUP BY division
+                ORDER BY division
+                """
+            )
+            champion_counts = {
+                row["division"]: row["champion_count"]
+                for row in champion_rows
+            }
+
+            for division in ("Lightweight", "Middleweight", "Heavyweight"):
+                count = champion_counts.get(division, 0)
+                if count <= 1:
+                    checks.append(
+                        f"✅ {division} champion integrity: **{count}** active"
+                    )
+                else:
+                    warnings.append(
+                        f"❌ {division} has **{count}** active champions"
+                    )
+
+    except Exception as exc:
+        warnings.append(
+            f"❌ Database diagnostic failed: `{type(exc).__name__}`"
+        )
+        fighter_count = "?"
+        active_fights = "?"
+        reversed_fights = "?"
+        override_count = "?"
+
+    # Verify the core commands are registered in Discord.py.
+    core_commands = [
+        "result",
+        "champresult",
+        "forcechampresult",
+        "undoresult",
+        "confirmundo",
+        "fighthistory",
+    ]
+
+    missing_commands = []
+    for command_name in core_commands:
+        if bot.get_command(command_name) is None:
+            missing_commands.append(command_name)
+
+    if missing_commands:
+        warnings.append(
+            "❌ Missing core commands: "
+            + ", ".join(f"`!{name}`" for name in missing_commands)
+        )
+    else:
+        checks.append("✅ Core result/undo/override commands registered")
+
+    healthy = not warnings
+    embed = discord.Embed(
+        title="🩺 OSBL SYSTEM CHECK",
+        description=(
+            "**ALL CORE SYSTEMS HEALTHY**"
+            if healthy
+            else "**ATTENTION REQUIRED — review warnings below**"
+        ),
+        color=discord.Color.green() if healthy else discord.Color.orange(),
+    )
+
+    embed.add_field(
+        name="🔎 Core Checks",
+        value="\n".join(checks) if checks else "No successful checks recorded.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📊 Live Database Snapshot",
+        value=(
+            f"Registered Fighters: **{fighter_count}**\n"
+            f"Active Fight Records: **{active_fights}**\n"
+            f"Reversed Fight Records: **{reversed_fights}**\n"
+            f"Commissioner Overrides Logged: **{override_count}**"
+        ),
+        inline=False,
+    )
+
+    if warnings:
+        embed.add_field(
+            name="⚠️ Warnings",
+            value="\n".join(warnings),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name} • Read-only diagnostic")
+    await ctx.send(embed=embed)
+
+
+# =========================================================
 # REGISTER FIGHTER
 # FORMAT:
 # !register Fighter Name | Division | Gym
