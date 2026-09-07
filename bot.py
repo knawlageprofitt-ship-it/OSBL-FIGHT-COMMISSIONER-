@@ -1048,99 +1048,99 @@ async def champresult(ctx, *, details: str = None):
     score
 )
 
-    if duplicate:
-        await ctx.send(
-            f"⚠️ **POSSIBLE DUPLICATE CHAMPIONSHIP RESULT**\n"
-            f"This championship fight appears to have already been recorded.\n"
-            f"History ID: **{duplicate['id']}**\n"
-            f"No records, RP, rankings, titles, or payouts were changed."
-        )
-        return
+        if duplicate:
+            await ctx.send(
+                f"⚠️ **POSSIBLE DUPLICATE CHAMPIONSHIP RESULT**\n"
+                f"This championship fight appears to have already been recorded.\n"
+                f"History ID: **{duplicate['id']}**\n"
+                f"No records, RP, rankings, titles, or payouts were changed."
+            )
+            return
 
-    async with conn.transaction():
-        await conn.execute(
-                """
-                INSERT INTO fight_history (
-                    fight_type,
+        async with conn.transaction():
+            await conn.execute(
+                    """
+                    INSERT INTO fight_history (
+                        fight_type,
+                        winner_key,
+                        loser_key,
+                        score,
+                        winner_rp_before,
+                        loser_rp_before,
+                        winner_wins_before,
+                        winner_losses_before,
+                        loser_wins_before,
+                        loser_losses_before,
+                        winner_earnings_before,
+                        loser_earnings_before,
+                        winner_champion_before,
+                        loser_champion_before,
+                        winner_title_defenses_before,
+                        loser_title_defenses_before
+                    )
+                    VALUES (
+                        'championship',
+                        $1, $2, $3,
+                        $4, $5,
+                        $6, $7,
+                        $8, $9,
+                        $10, $11,
+                        $12, $13,
+                        $14, $15
+                    )
+                    """,
                     winner_key,
                     loser_key,
                     score,
-                    winner_rp_before,
-                    loser_rp_before,
-                    winner_wins_before,
-                    winner_losses_before,
-                    loser_wins_before,
-                    loser_losses_before,
-                    winner_earnings_before,
-                    loser_earnings_before,
-                    winner_champion_before,
-                    loser_champion_before,
-                    winner_title_defenses_before,
-                    loser_title_defenses_before
+                    winner["rp"],
+                    loser["rp"],
+                    winner["wins"],
+                    winner["losses"],
+                    loser["wins"],
+                    loser["losses"],
+                    winner["career_earnings"],
+                    loser["career_earnings"],
+                    winner["champion"],
+                    loser["champion"],
+                    winner["title_defenses"],
+                    loser["title_defenses"]
                 )
-                VALUES (
-                    'championship',
-                    $1, $2, $3,
-                    $4, $5,
-                    $6, $7,
-                    $8, $9,
-                    $10, $11,
-                    $12, $13,
-                    $14, $15
-                )
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET wins = wins + 1,
+                    rp = $1,
+                    progression_rank = $2,
+                    champion = TRUE,
+                    title_defenses = title_defenses + $3,
+                    career_earnings = career_earnings + $4,
+                    updated_at = NOW()
+                WHERE fighter_key = $5
                 """,
-                winner_key,
-                loser_key,
-                score,
-                winner["rp"],
-                loser["rp"],
-                winner["wins"],
-                winner["losses"],
-                loser["wins"],
-                loser["losses"],
-                winner["career_earnings"],
-                loser["career_earnings"],
-                winner["champion"],
-                loser["champion"],
-                winner["title_defenses"],
-                loser["title_defenses"]
+                new_winner_rp,
+                winner_progression,
+                1 if defending_champion else 0,
+                winner_purse,
+                winner_key
             )
 
-        await conn.execute(
-            """
-            UPDATE fighters
-            SET wins = wins + 1,
-                rp = $1,
-                progression_rank = $2,
-                champion = TRUE,
-                title_defenses = title_defenses + $3,
-                career_earnings = career_earnings + $4,
-                updated_at = NOW()
-            WHERE fighter_key = $5
-            """,
-            new_winner_rp,
-            winner_progression,
-            1 if defending_champion else 0,
-            winner_purse,
-            winner_key
-        )
-
-        await conn.execute(
-            """
-            UPDATE fighters
-            SET losses = losses + 1,
-                rp = $1,
-                progression_rank = $2,
-                champion = FALSE,
-                career_earnings = career_earnings + $3,
-                updated_at = NOW()
-            WHERE fighter_key = $4
-            """,
-            new_loser_rp,
-            loser_progression,
-            loser_purse,
-            loser_key
-        )
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET losses = losses + 1,
+                    rp = $1,
+                    progression_rank = $2,
+                    champion = FALSE,
+                    career_earnings = career_earnings + $3,
+                    updated_at = NOW()
+                WHERE fighter_key = $4
+                """,
+                new_loser_rp,
+                loser_progression,
+                loser_purse,
+                loser_key
+            )
 
     await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
