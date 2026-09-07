@@ -136,6 +136,16 @@ class OSBLBot(commands.Bot):
                 WHERE status = 'active';
             """)
 
+            await conn.execute("""
+                ALTER TABLE fight_history
+                ADD COLUMN IF NOT EXISTS fight_night_session_id BIGINT;
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS fight_history_session_idx
+                ON fight_history (fight_night_session_id);
+            """)
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -356,6 +366,7 @@ async def systemcheck(ctx):
         "fighthistory",
         "startfightnight",
         "fightnightstatus",
+        "fightnightrecap",
         "endfightnight",
     ]
 
@@ -654,6 +665,137 @@ async def endfightnight(ctx):
         inline=False,
     )
     embed.set_footer(text="Fight Night session archived in the OSBL database")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def fightnightrecap(ctx, session_id: int = None):
+    async with bot.db.acquire() as conn:
+        if session_id is None:
+            session = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_night_sessions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+        else:
+            session = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_night_sessions
+                WHERE id = $1
+                """,
+                session_id,
+            )
+
+        if not session:
+            await ctx.send(
+                "❌ **FIGHT NIGHT SESSION NOT FOUND**\n"
+                "Use `!fightnightrecap <Session ID>`."
+            )
+            return
+
+        fights = await conn.fetch(
+            """
+            SELECT
+                fh.id,
+                fh.fight_type,
+                fh.winner_key,
+                fh.loser_key,
+                fh.score,
+                fh.undone,
+                fw.fighter_name AS winner_name,
+                fl.fighter_name AS loser_name
+            FROM fight_history fh
+            LEFT JOIN fighters fw ON fw.fighter_key = fh.winner_key
+            LEFT JOIN fighters fl ON fl.fighter_key = fh.loser_key
+            WHERE
+                fh.fight_night_session_id = $1
+                OR (
+                    fh.fight_night_session_id IS NULL
+                    AND fh.id > $2
+                    AND ($3::BIGINT IS NULL OR fh.id <= $3)
+                )
+            ORDER BY fh.id ASC
+            """,
+            session["id"],
+            session["start_history_id"],
+            session["end_history_id"],
+        )
+
+    status_text = "🟢 ACTIVE" if session["status"] == "active" else "🔒 CLOSED"
+    embed = discord.Embed(
+        title=f"📜 OSBL FIGHT NIGHT RECAP — SESSION {session['id']}",
+        description=f"{status_text}\n**Official Fight Ledger**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Session Staff",
+        value=(
+            f"Opened by: **{session['started_by_name']}**\n"
+            + (
+                f"Closed by: **{session['ended_by_name']}**"
+                if session["ended_by_name"]
+                else "Closed by: **—**"
+            )
+        ),
+        inline=False,
+    )
+
+    if not fights:
+        embed.add_field(
+            name="🥊 Recorded Fights",
+            value="No fights were recorded during this session.",
+            inline=False,
+        )
+    else:
+        lines = []
+        for fight in fights:
+            winner_name = fight["winner_name"] or fight["winner_key"]
+            loser_name = fight["loser_name"] or fight["loser_key"]
+            fight_label = (
+                "Championship"
+                if fight["fight_type"] == "championship"
+                else "Regular"
+            )
+            result_status = "↩️ REVERSED" if fight["undone"] else "✅ OFFICIAL"
+            lines.append(
+                f"**#{fight['id']}** • {fight_label} • {result_status}\n"
+                f"🏆 **{winner_name}** def. **{loser_name}** • {fight['score']}"
+            )
+
+        # Discord embed field values max out at 1024 characters.
+        chunks = []
+        current = ""
+        for line in lines:
+            addition = line if not current else "\n\n" + line
+            if len(current) + len(addition) > 1000:
+                chunks.append(current)
+                current = line
+            else:
+                current += addition
+        if current:
+            chunks.append(current)
+
+        for index, chunk in enumerate(chunks, start=1):
+            field_name = "🥊 Fight Card Results" if index == 1 else f"🥊 Results Continued ({index})"
+            embed.add_field(name=field_name, value=chunk, inline=False)
+
+    embed.add_field(
+        name="Ledger Range",
+        value=(
+            f"Started after History ID **{session['start_history_id']}**\n"
+            + (
+                f"Closed at History ID **{session['end_history_id']}**"
+                if session["end_history_id"] is not None
+                else "Session is still active"
+            )
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Use !fightnightrecap <Session ID> to review archived Fight Nights")
     await ctx.send(embed=embed)
 
 
@@ -1129,6 +1271,17 @@ async def result(ctx, *, details: str = None):
             f"No records, RP, rankings, or payouts were changed."
            )
            return
+
+       fight_night_session_id = await conn.fetchval(
+           """
+           SELECT id
+           FROM fight_night_sessions
+           WHERE status = 'active'
+           ORDER BY id DESC
+           LIMIT 1
+           """
+       )
+
        async with conn.transaction():
 
            await conn.execute(
@@ -1149,7 +1302,8 @@ async def result(ctx, *, details: str = None):
                 winner_champion_before,
                 loser_champion_before,
                 winner_title_defenses_before,
-                loser_title_defenses_before
+                loser_title_defenses_before,
+                fight_night_session_id
             )
             VALUES (
                 'regular',
@@ -1159,7 +1313,8 @@ async def result(ctx, *, details: str = None):
                 $8, $9,
                 $10, $11,
                 $12, $13,
-                $14, $15
+                $14, $15,
+                $16
             )
             """,
             winner_key,
@@ -1176,7 +1331,8 @@ async def result(ctx, *, details: str = None):
             winner["champion"],
             loser["champion"],
             winner["title_defenses"],
-            loser["title_defenses"]
+            loser["title_defenses"],
+            fight_night_session_id
         )
 
            await conn.execute(
@@ -1494,6 +1650,16 @@ async def champresult(ctx, *, details: str = None):
             )
             return
 
+        fight_night_session_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM fight_night_sessions
+            WHERE status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+
         async with conn.transaction():
             await conn.execute(
                     """
@@ -1513,7 +1679,8 @@ async def champresult(ctx, *, details: str = None):
                         winner_champion_before,
                         loser_champion_before,
                         winner_title_defenses_before,
-                        loser_title_defenses_before
+                        loser_title_defenses_before,
+                        fight_night_session_id
                     )
                     VALUES (
                         'championship',
@@ -1523,7 +1690,8 @@ async def champresult(ctx, *, details: str = None):
                         $8, $9,
                         $10, $11,
                         $12, $13,
-                        $14, $15
+                        $14, $15,
+                        $16
                     )
                     """,
                     winner_key,
@@ -1540,7 +1708,8 @@ async def champresult(ctx, *, details: str = None):
                     winner["champion"],
                     loser["champion"],
                     winner["title_defenses"],
-                    loser["title_defenses"]
+                    loser["title_defenses"],
+                    fight_night_session_id
                 )
 
             await conn.execute(
