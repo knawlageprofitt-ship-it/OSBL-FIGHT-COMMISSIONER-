@@ -688,14 +688,14 @@ async def result(ctx, *, details: str = None):
        )
 
        if duplicate:
-        await ctx.send(
+           await ctx.send(
             f"⚠️ **POSSIBLE DUPLICATE RESULT**\n"
             f"This fight appears to have already been recorded.\n"
             f"History ID: **{duplicate['id']}**\n"
             f"No records, RP, rankings, or payouts were changed."
-        )
-        return
-        async with conn.transaction():
+           )
+           return
+       async with conn.transaction():
 
            await conn.execute(
             """
