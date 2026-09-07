@@ -1028,9 +1028,37 @@ async def champresult(ctx, *, details: str = None):
     loser_progression = progression_for(new_loser_rp)
 
     async with bot.db.acquire() as conn:
-        async with conn.transaction():
 
-                        await conn.execute(
+        duplicate = await conn.fetchrow(
+    """
+    SELECT id, created_at
+    FROM fight_history
+    WHERE fight_type = $1
+      AND winner_key = $2
+      AND loser_key = $3
+      AND score = $4
+      AND undone = FALSE
+      AND created_at >= NOW() - INTERVAL '10 minutes'
+    ORDER BY id DESC
+    LIMIT 1
+    """,
+    "championship",
+    winner_key,
+    loser_key,
+    score
+)
+
+if duplicate:
+    await ctx.send(
+        f"⚠️ **POSSIBLE DUPLICATE CHAMPIONSHIP RESULT**\n"
+        f"This championship fight appears to have already been recorded.\n"
+        f"History ID: **{duplicate['id']}**\n"
+        f"No records, RP, rankings, titles, or payouts were changed."
+    )
+    return
+ async with conn.transaction():
+
+     await conn.execute(
                 """
                 INSERT INTO fight_history (
                     fight_type,
