@@ -333,7 +333,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V2-VERIFY-2026-09-07"
+POSTER_RENDERER_VERSION = "V3-MOBILE-READABLE-2026-09-07"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -624,98 +624,76 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
         canvas = canvas.resize((1122, 1402), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(canvas)
 
-    # Portrait windows inside the existing gold frames.
+    # Portrait windows. Keep these inside the existing gold frames.
     _paste_fighter_portrait(canvas, fighter1["photo_data"], (31, 372, 451, 891))
     _paste_fighter_portrait(canvas, fighter2["photo_data"], (671, 372, 1091, 891))
 
-    # Large, readable fighter name bands.
-    name_panels = ((28, 888, 456, 968), (666, 888, 1094, 968))
-    for panel in name_panels:
-        _draw_panel(draw, panel, fill=(7, 7, 7), outline=(214, 170, 72), width=2)
+    # Rebuild the entire lower information area instead of depending on any
+    # AI-baked placeholder text. This makes the live information readable on mobile.
+    gold = (224, 180, 72)
+    white = (250, 250, 250)
+    muted = (190, 190, 190)
+    black = (6, 6, 6)
+
+    left_name = (25, 884, 458, 970)
+    right_name = (664, 884, 1097, 970)
+    for panel in (left_name, right_name):
+        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
 
     name1 = str(fighter1["fighter_name"]).upper()
     name2 = str(fighter2["fighter_name"]).upper()
-    font1 = _fit_font(draw, name1, 392, 46, 24)
-    font2 = _fit_font(draw, name2, 392, 46, 24)
-    _draw_centered(draw, (39, 898, 445, 958), name1, font1, fill=(252, 252, 252), stroke=2)
-    _draw_centered(draw, (677, 898, 1083, 958), name2, font2, fill=(252, 252, 252), stroke=2)
+    font1 = _fit_font(draw, name1, 392, 52, 28)
+    font2 = _fit_font(draw, name2, 392, 52, 28)
+    _draw_centered(draw, (38, 895, 445, 958), name1, font1, fill=white, stroke=2)
+    _draw_centered(draw, (677, 895, 1084, 958), name2, font2, fill=white, stroke=2)
 
-    # Rebuild the stat rows so values remain readable on a phone screen.
-    # The template's stat labels stay visible above; these panels replace only
-    # the baked placeholder values underneath them.
-    left_boxes = [
-        (39, 1021, 126, 1074),
-        (128, 1021, 214, 1074),
-        (217, 1021, 360, 1074),
-        (363, 1021, 445, 1074),
-    ]
-    right_boxes = [
-        (679, 1021, 766, 1074),
-        (768, 1021, 854, 1074),
-        (857, 1021, 1000, 1074),
-        (1003, 1021, 1087, 1074),
-    ]
+    # Full stat panels with our own labels and values.
+    left_stats = (25, 969, 458, 1085)
+    right_stats = (664, 969, 1097, 1085)
+    for panel in (left_stats, right_stats):
+        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
 
-    values1 = [
-        f"{fighter1['wins']}-{fighter1['losses']}",
-        str(fighter1["rp"]),
-        str(fighter1["progression_rank"] or "--").upper(),
-        f"#{fighter1['division_rank']}" if fighter1["division_rank"] else "--",
-    ]
-    values2 = [
-        f"{fighter2['wins']}-{fighter2['losses']}",
-        str(fighter2["rp"]),
-        str(fighter2["progression_rank"] or "--").upper(),
-        f"#{fighter2['division_rank']}" if fighter2["division_rank"] else "--",
-    ]
+    def draw_stat_row(panel, fighter):
+        x1, y1, x2, y2 = panel
+        widths = [0.23, 0.18, 0.36, 0.23]
+        labels = ["RECORD", "RP", "PROGRESSION", "DIVISION RANK"]
+        values = [
+            f"{fighter['wins']}-{fighter['losses']}",
+            str(fighter["rp"]),
+            str(fighter["progression_rank"] or "--").upper(),
+            f"#{fighter['division_rank']}" if fighter["division_rank"] else "--",
+        ]
+        px = x1 + 8
+        usable = (x2 - x1) - 16
+        for i, (frac, label, value) in enumerate(zip(widths, labels, values)):
+            cw = int(usable * frac)
+            cell = (px, y1 + 6, px + cw, y2 - 6)
+            if i:
+                draw.line((px, y1 + 12, px, y2 - 12), fill=(115, 91, 40), width=1)
+            label_font = _fit_font(draw, label, cw - 8, 16, 11)
+            value_font = _fit_font(draw, value, cw - 8, 27, 16)
+            _draw_centered(draw, (cell[0]+2, y1+10, cell[2]-2, y1+43), label, label_font, fill=gold, stroke=1)
+            _draw_centered(draw, (cell[0]+2, y1+45, cell[2]-2, y2-8), value, value_font, fill=white, stroke=1)
+            px += cw
 
-    for box, value in zip(left_boxes, values1):
-        _cover_value_area(draw, box, fill=(7, 7, 7))
-        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 31, 16)
-        _draw_centered(draw, box, value, fnt, fill=(252, 252, 252), stroke=1)
-    for box, value in zip(right_boxes, values2):
-        _cover_value_area(draw, box, fill=(7, 7, 7))
-        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 31, 16)
-        _draw_centered(draw, box, value, fnt, fill=(252, 252, 252), stroke=1)
+    draw_stat_row(left_stats, fighter1)
+    draw_stat_row(right_stats, fighter2)
 
-    # The AI-generated template can warp the division wording. Cover that
-    # entire label and redraw the official division text deterministically.
-    division_panel = (286, 1090, 836, 1180)
-    _draw_panel(draw, division_panel, fill=(8, 8, 8), outline=(214, 170, 72), width=3)
-
+    # Completely cover and redraw the division/bout panel.
+    division_panel = (279, 1091, 843, 1182)
+    _draw_panel(draw, division_panel, fill=black, outline=gold, width=4)
     division_text = f"{division.upper()} DIVISION"
-    division_font = _fit_font(draw, division_text, 500, 38, 22)
-    _draw_centered(
-        draw,
-        (305, 1098, 817, 1145),
-        division_text,
-        division_font,
-        fill=(235, 190, 82),
-        stroke=2,
-    )
+    division_font = _fit_font(draw, division_text, 520, 40, 25)
+    _draw_centered(draw, (297, 1098, 825, 1144), division_text, division_font, fill=gold, stroke=2)
 
     bout_text = "CHAMPIONSHIP BOUT" if booking["bout_type"] == "championship" else "REGULAR BOUT"
     bout_font = _fit_font(draw, bout_text, 390, 24, 16)
-    _draw_centered(
-        draw,
-        (360, 1140, 762, 1172),
-        bout_text,
-        bout_font,
-        fill=(248, 248, 248),
-        stroke=1,
-    )
+    _draw_centered(draw, (360, 1143, 762, 1175), bout_text, bout_font, fill=white, stroke=1)
 
-    # Booking ID remains small but readable for commissioner audit/troubleshooting.
+    # Booking ID remains small for commissioner audit/troubleshooting.
     booking_text = f"BOOKING #{booking['id']}"
     booking_font = _load_osbl_font(18, bold=True)
-    draw.text(
-        (18, 1365),
-        booking_text,
-        font=booking_font,
-        fill=(214, 170, 72),
-        stroke_width=1,
-        stroke_fill=(0, 0, 0),
-    )
+    draw.text((18, 1365), booking_text, font=booking_font, fill=gold, stroke_width=1, stroke_fill=(0, 0, 0))
 
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
