@@ -335,6 +335,7 @@ async def osbl(ctx):
 
 POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
+FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -455,6 +456,8 @@ async def systemcheck(ctx):
         "rankings",
         "allrankings",
         "top10",
+        "fighter",
+        "fightercard",
     ]
 
     missing_commands = []
@@ -508,6 +511,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="📊 Rankings System",
         value=f"**{RANKINGS_SYSTEM_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🥊 Fighter Profiles",
+        value=f"**{FIGHTER_PROFILE_VERSION}**",
         inline=False,
     )
 
@@ -2164,22 +2173,204 @@ async def register(ctx, *, details: str = None):
 
 
 # =========================================================
-# FIGHTER PROFILE
-# FORMAT:
+# OSBL FIGHTER PROFILE CARDS
+# COMMANDS:
 # !fighter Fighter Name
+# !fightercard Fighter Name
+# !profile Fighter Name
 # =========================================================
 
-@bot.command()
-async def fighter(ctx, *, fighter_name: str = None):
 
+def _profile_title_eligibility(row):
+    if row["champion"]:
+        return "👑 **CURRENT CHAMPION**"
+
+    rp = int(row["rp"] or 0)
+    if rp >= 140:
+        return "🏆 **TITLE ELIGIBLE**"
+
+    return f"🔒 **{140 - rp} RP** away from Title Eligibility"
+
+
+def _profile_gym_name(gym):
+    gym = (gym or "").strip()
+    return gym if gym else "Independent / No Gym Assigned"
+
+
+FIGHTER_PROFILE_TEMPLATE_FILE = "osbl_official_fighter_card.png"
+
+
+def _render_osbl_fighter_profile_card(row, recent_results):
+    """Render the official OSBL fighter profile card as a Discord-ready PNG."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt.") from exc
+
+    template_path = _fight_card_asset_path(FIGHTER_PROFILE_TEMPLATE_FILE)
+    if not template_path.exists():
+        raise RuntimeError(f"Missing fighter profile template file: {FIGHTER_PROFILE_TEMPLATE_FILE}")
+
+    canvas = Image.open(template_path).convert("RGB")
+    if canvas.size != (1122, 1402):
+        canvas = canvas.resize((1122, 1402), Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(canvas)
+
+    gold = (232, 188, 80)
+    white = (250, 250, 250)
+    muted = (205, 205, 205)
+    black = (6, 6, 6)
+    green = (58, 220, 88)
+
+    # Live fighter portrait. If no photo is locked, preserve the template silhouette.
+    if row["photo_data"]:
+        _paste_fighter_portrait(canvas, row["photo_data"], (112, 331, 532, 919))
+
+    fighter_name = str(row["fighter_name"] or "FIGHTER").upper()
+    division = str(row["division"] or "UNASSIGNED").upper()
+    gym = _profile_gym_name(row["gym"])
+    progression = str(row["progression_rank"] or "Prospect").upper()
+    record = f"{int(row['wins'] or 0)}-{int(row['losses'] or 0)}"
+    rp = int(row["rp"] or 0)
+    earnings = int(row["career_earnings"] or 0)
+    defenses = int(row["title_defenses"] or 0)
+    if row["champion"]:
+        rank_text = "CHAMPION"
+        status_text = "CHAMPION"
+        status_fill = gold
+        eligibility_text = "CURRENT CHAMPION"
+        eligibility_value = 140
+    else:
+        rank_text = f"#{row['division_rank']}" if row["division_rank"] else "UNRANKED"
+        status_text = "ACTIVE"
+        status_fill = green
+        if rp >= 140:
+            eligibility_text = "TITLE ELIGIBLE"
+            eligibility_value = 140
+        else:
+            eligibility_text = f"{140-rp} RP AWAY"
+            eligibility_value = max(0, rp)
+
+    # Cover the baked right-side placeholders and redraw live league data.
+    _draw_panel(draw, (548, 323, 991, 421), fill=black, outline=gold, width=3)
+    name_font = _fit_font(draw, fighter_name, 405, 48, 25)
+    _draw_centered(draw, (567, 337, 974, 389), fighter_name, name_font, fill=gold, stroke=2)
+    sub_font = _fit_font(draw, "OFFICIAL OSBL FIGHTER", 390, 20, 13)
+    _draw_centered(draw, (570, 389, 970, 414), "OFFICIAL OSBL FIGHTER", sub_font, fill=muted, stroke=1)
+
+    # Gym and division panels.
+    for panel in ((548, 433, 765, 534), (775, 433, 991, 534)):
+        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
+    label_font = _load_osbl_font(16, bold=True)
+    draw.text((570, 446), "GYM", font=label_font, fill=gold, stroke_width=1, stroke_fill=black)
+    gym_font = _fit_font(draw, gym.upper(), 180, 22, 13)
+    _draw_centered(draw, (565, 470, 750, 522), gym.upper(), gym_font, fill=white, stroke=1)
+    draw.text((797, 446), "DIVISION", font=label_font, fill=gold, stroke_width=1, stroke_fill=black)
+    div_font = _fit_font(draw, division, 175, 22, 13)
+    _draw_centered(draw, (790, 470, 978, 522), division, div_font, fill=white, stroke=1)
+
+    # Six live stat boxes.
+    stat_panels = [
+        ((548, 544, 691, 638), "RECORD", record),
+        ((699, 544, 839, 638), "RP", str(rp)),
+        ((847, 544, 991, 638), "PROGRESSION", progression),
+        ((548, 648, 765, 742), "DIVISION RANK", rank_text),
+        ((775, 648, 991, 742), "CAREER EARNINGS", f"${earnings:,}"),
+        ((548, 752, 765, 846), "TITLE DEFENSES", str(defenses)),
+    ]
+    for panel, label, value in stat_panels:
+        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
+        x1, y1, x2, y2 = panel
+        lf = _fit_font(draw, label, (x2-x1)-18, 15, 10)
+        vf = _fit_font(draw, value, (x2-x1)-18, 25, 13)
+        _draw_centered(draw, (x1+8, y1+8, x2-8, y1+35), label, lf, fill=gold, stroke=1)
+        _draw_centered(draw, (x1+8, y1+38, x2-8, y2-8), value, vf, fill=white, stroke=1)
+
+    _draw_panel(draw, (775, 752, 991, 846), fill=black, outline=gold, width=3)
+    _draw_centered(draw, (790, 760, 976, 789), "STATUS", _load_osbl_font(15, bold=True), fill=gold, stroke=1)
+    sf = _fit_font(draw, status_text, 175, 27, 15)
+    _draw_centered(draw, (790, 791, 976, 835), status_text, sf, fill=status_fill, stroke=1)
+
+    # 140 RP title-eligibility bar.
+    _draw_panel(draw, (548, 856, 991, 938), fill=black, outline=gold, width=3)
+    head_font = _fit_font(draw, "140 RP TITLE ELIGIBILITY", 390, 20, 13)
+    _draw_centered(draw, (570, 861, 970, 887), "140 RP TITLE ELIGIBILITY", head_font, fill=white, stroke=1)
+    bar_x1, bar_y1, bar_x2, bar_y2 = 595, 896, 858, 916
+    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=6, fill=(35,35,35), outline=gold, width=2)
+    ratio = min(1.0, max(0.0, eligibility_value / 140.0))
+    if ratio > 0:
+        fill_x = bar_x1 + int((bar_x2-bar_x1) * ratio)
+        draw.rounded_rectangle((bar_x1, bar_y1, fill_x, bar_y2), radius=6, fill=gold)
+    prog_text = "140 / 140" if row["champion"] or rp >= 140 else f"{rp} / 140"
+    draw.text((872, 894), prog_text, font=_load_osbl_font(15, bold=True), fill=white, stroke_width=1, stroke_fill=black)
+    elig_font = _fit_font(draw, eligibility_text, 365, 16, 11)
+    _draw_centered(draw, (595, 918, 970, 936), eligibility_text, elig_font, fill=gold, stroke=1)
+
+    # Recent results strip: render up to three official fights.
+    _draw_panel(draw, (111, 948, 991, 1137), fill=black, outline=gold, width=3)
+    _draw_centered(draw, (135, 955, 966, 991), "RECENT RESULTS", _load_osbl_font(23, bold=True), fill=gold, stroke=1)
+    y = 1004
+    if recent_results:
+        for result in recent_results[:3]:
+            rf = _fit_font(draw, result.replace("**", ""), 810, 18, 11)
+            _draw_centered(draw, (145, y, 958, y+35), result.replace("**", ""), rf, fill=white, stroke=1)
+            y += 43
+    else:
+        _draw_centered(draw, (145, 1020, 958, 1080), "NO OFFICIAL FIGHTS RECORDED YET", _load_osbl_font(18, bold=True), fill=muted, stroke=1)
+
+    # Small version marker for deployment verification.
+    vf = _load_osbl_font(13, bold=True)
+    draw.text((114, 1150), FIGHTER_PROFILE_VERSION, font=vf, fill=gold, stroke_width=1, stroke_fill=black)
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+async def _recent_fighter_results(fighter_key, limit=3):
+    rows = await bot.db.fetch(
+        """
+        SELECT fight_type, winner_key, loser_key, score, created_at
+        FROM fight_history
+        WHERE undone = FALSE
+          AND (winner_key = $1 OR loser_key = $1)
+        ORDER BY id DESC
+        LIMIT $2
+        """,
+        fighter_key,
+        int(limit),
+    )
+
+    results = []
+    for fight in rows:
+        won = fight["winner_key"] == fighter_key
+        opponent_key = fight["loser_key"] if won else fight["winner_key"]
+        opponent_name = await bot.db.fetchval(
+            "SELECT fighter_name FROM fighters WHERE fighter_key = $1",
+            opponent_key,
+        )
+        opponent_name = opponent_name or opponent_key
+        label = "W" if won else "L"
+        fight_type = str(fight["fight_type"] or "Regular").title()
+        results.append(
+            f"**{label}** vs **{opponent_name}** • {fight['score']} • {fight_type}"
+        )
+
+    return results
+
+
+@bot.command(aliases=["fightercard", "profile"])
+async def fighter(ctx, *, fighter_name: str = None):
     if not fighter_name:
         await ctx.send(
             "❌ Use:\n"
-            "`!fighter Fighter Name`"
+            "`!fighter Fighter Name`\n"
+            "or `!fightercard Fighter Name`"
         )
         return
 
-    fighter_key = fighter_name.casefold()
+    fighter_key = fighter_name.casefold().strip()
 
     row = await bot.db.fetchrow(
         """
@@ -2187,103 +2378,77 @@ async def fighter(ctx, *, fighter_name: str = None):
         FROM fighters
         WHERE fighter_key = $1
         """,
-        fighter_key
+        fighter_key,
     )
 
     if not row:
-        await ctx.send(
-            f"❌ **{fighter_name} is not registered in OSBL.**"
-        )
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
         return
 
+    # Refresh the fighter's division rank before presenting the official card.
     await update_division_rankings(row["division"])
-
     row = await bot.db.fetchrow(
-    """
-    SELECT *
-    FROM fighters
-    WHERE fighter_key = $1
-    """,
-    fighter_key
-)
-
-    title_status = (
-        "👑 CHAMPION"
-        if row["champion"]
-        else "🥊 ACTIVE FIGHTER"
+        "SELECT * FROM fighters WHERE fighter_key = $1",
+        fighter_key,
     )
 
-    division_rank = (
-        f"#{row['division_rank']}"
-        if row["division_rank"]
-        else "Unranked"
-    )
+    gym_name = _profile_gym_name(row["gym"])
+    if row["champion"]:
+        status = "👑 CHAMPION"
+        division_rank = "CHAMPION"
+    else:
+        status = "🥊 ACTIVE FIGHTER"
+        division_rank = f"#{row['division_rank']}" if row["division_rank"] else "Unranked"
+
+    total_bouts = int(row["wins"] or 0) + int(row["losses"] or 0)
+    win_rate = (int(row["wins"] or 0) / total_bouts * 100) if total_bouts else 0.0
+    recent_results = await _recent_fighter_results(fighter_key, limit=3)
 
     embed = discord.Embed(
         title="🥊 OSBL OFFICIAL FIGHTER PROFILE",
-        description=f"**{row['fighter_name']}**",
-        color=discord.Color.gold()
+        description=(
+            f"## {row['fighter_name']}\n"
+            f"**{row['division']} Division** • {status}\n"
+            f"{_profile_title_eligibility(row)}"
+        ),
+        color=discord.Color.gold(),
     )
 
-    embed.add_field(
-        name="🏢 Gym",
-        value=row["gym"],
-        inline=True
-    )
+    embed.add_field(name="🏢 Gym", value=gym_name, inline=True)
+    embed.add_field(name="🥊 Record", value=f"**{row['wins']}-{row['losses']}**", inline=True)
+    embed.add_field(name="🏅 Division Rank", value=f"**{division_rank}**", inline=True)
+
+    embed.add_field(name="💎 Ranking Points", value=f"**{row['rp']} RP**", inline=True)
+    embed.add_field(name="📈 Progression", value=f"**{row['progression_rank']}**", inline=True)
+    embed.add_field(name="📊 Win Rate", value=f"**{win_rate:.0f}%**", inline=True)
+
+    embed.add_field(name="💰 Career Earnings", value=f"**${row['career_earnings']:,}**", inline=True)
+    embed.add_field(name="🛡️ Title Defenses", value=f"**{row['title_defenses']}**", inline=True)
+    embed.add_field(name="🎯 Title Status", value=_profile_title_eligibility(row), inline=True)
 
     embed.add_field(
-        name="⚖️ Division",
-        value=row["division"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="🥊 Record",
-        value=f"{row['wins']}-{row['losses']}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="💠 RP",
-        value=f"{row['rp']} RP",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📈 Progression",
-        value=row["progression_rank"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="🏅 Division Ranking",
-        value=division_rank,
-        inline=True
-    )
-
-    embed.add_field(
-        name="💰 Career Earnings",
-        value=f"${row['career_earnings']:,}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="👑 Status",
-        value=title_status,
-        inline=True
-    )
-
-    embed.add_field(
-        name="🛡️ Title Defenses",
-        value=str(row["title_defenses"]),
-        inline=True
+        name="🕘 Recent Results",
+        value="\n".join(recent_results) if recent_results else "No official fights recorded yet.",
+        inline=False,
     )
 
     embed.set_footer(
-        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+        text=f"{FIGHTER_PROFILE_VERSION} • ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
     )
 
-    await ctx.send(embed=embed)
+    try:
+        card_bytes = _render_osbl_fighter_profile_card(row, recent_results)
+        card_file = discord.File(card_bytes, filename="osbl_official_fighter_card.png")
+        embed.set_image(url="attachment://osbl_official_fighter_card.png")
+        await ctx.send(embed=embed, file=card_file)
+    except Exception as exc:
+        # Never block staff from seeing the fighter profile if artwork fails.
+        embed.add_field(
+            name="⚠️ Fighter Card Renderer",
+            value=f"Profile data loaded, but the visual card could not render: `{exc}`",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
 
 
 # =========================================================
