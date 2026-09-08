@@ -565,10 +565,15 @@ def _draw_centered(draw, xy_box, text, font, fill=(245, 245, 245), stroke=2, str
     draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke, stroke_fill=stroke_fill)
 
 
-def _cover_value_area(draw, box):
-    # Near-black cover keeps the generated template texture feeling intact while
-    # hiding placeholder values so live database data can be drawn cleanly.
-    draw.rectangle(box, fill=(8, 8, 8))
+def _cover_value_area(draw, box, fill=(8, 8, 8)):
+    """Cover baked placeholder text so live OSBL data can be redrawn cleanly."""
+    draw.rectangle(box, fill=fill)
+
+
+def _draw_panel(draw, box, fill=(8, 8, 8), outline=(214, 170, 72), width=2):
+    """Draw a clean black/gold information panel over baked template text."""
+    x1, y1, x2, y2 = box
+    draw.rounded_rectangle((x1, y1, x2, y2), radius=10, fill=fill, outline=outline, width=width)
 
 
 def _paste_fighter_portrait(canvas, photo_bytes, box):
@@ -576,20 +581,22 @@ def _paste_fighter_portrait(canvas, photo_bytes, box):
 
     portrait = Image.open(io.BytesIO(bytes(photo_bytes))).convert("RGB")
     x1, y1, x2, y2 = box
+
+    # Use one consistent crop rule for every fighter so portrait framing is
+    # predictable across the whole league. Slightly favor the upper body/face.
     portrait = ImageOps.fit(
         portrait,
         (x2 - x1, y2 - y1),
         method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.42),
+        centering=(0.5, 0.38),
     )
-    # Slight contrast boost helps varied RP screenshots/photos sit naturally in
-    # the high-contrast arena template.
-    portrait = ImageEnhance.Contrast(portrait).enhance(1.05)
+    portrait = ImageEnhance.Contrast(portrait).enhance(1.06)
+    portrait = ImageEnhance.Sharpness(portrait).enhance(1.04)
     canvas.paste(portrait, (x1, y1))
 
 
 def _render_osbl_fight_poster(booking, fighter1, fighter2):
-    """Return a PNG BytesIO for a locked OSBL matchup."""
+    """Return a polished PNG BytesIO for an OSBL matchup."""
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
@@ -613,20 +620,33 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
     _paste_fighter_portrait(canvas, fighter1["photo_data"], (31, 372, 451, 891))
     _paste_fighter_portrait(canvas, fighter2["photo_data"], (671, 372, 1091, 891))
 
-    # Name bands.
-    _cover_value_area(draw, (36, 899, 447, 963))
-    _cover_value_area(draw, (676, 899, 1087, 963))
+    # Large, readable fighter name bands.
+    name_panels = ((28, 888, 456, 968), (666, 888, 1094, 968))
+    for panel in name_panels:
+        _draw_panel(draw, panel, fill=(7, 7, 7), outline=(214, 170, 72), width=2)
+
     name1 = str(fighter1["fighter_name"]).upper()
     name2 = str(fighter2["fighter_name"]).upper()
-    font1 = _fit_font(draw, name1, 385, 38, 20)
-    font2 = _fit_font(draw, name2, 385, 38, 20)
-    _draw_centered(draw, (39, 902, 444, 960), name1, font1, fill=(248, 248, 248), stroke=2)
-    _draw_centered(draw, (679, 902, 1084, 960), name2, font2, fill=(248, 248, 248), stroke=2)
+    font1 = _fit_font(draw, name1, 392, 46, 24)
+    font2 = _fit_font(draw, name2, 392, 46, 24)
+    _draw_centered(draw, (39, 898, 445, 958), name1, font1, fill=(252, 252, 252), stroke=2)
+    _draw_centered(draw, (677, 898, 1083, 958), name2, font2, fill=(252, 252, 252), stroke=2)
 
-    # Live stat values. Keep the template's printed labels, replace only values.
-    stat_y = (1030, 1074)
-    left_boxes = [(39, stat_y[0], 126, stat_y[1]), (128, stat_y[0], 214, stat_y[1]), (217, stat_y[0], 360, stat_y[1]), (363, stat_y[0], 445, stat_y[1])]
-    right_boxes = [(679, stat_y[0], 766, stat_y[1]), (768, stat_y[0], 854, stat_y[1]), (857, stat_y[0], 1000, stat_y[1]), (1003, stat_y[0], 1087, stat_y[1])]
+    # Rebuild the stat rows so values remain readable on a phone screen.
+    # The template's stat labels stay visible above; these panels replace only
+    # the baked placeholder values underneath them.
+    left_boxes = [
+        (39, 1021, 126, 1074),
+        (128, 1021, 214, 1074),
+        (217, 1021, 360, 1074),
+        (363, 1021, 445, 1074),
+    ]
+    right_boxes = [
+        (679, 1021, 766, 1074),
+        (768, 1021, 854, 1074),
+        (857, 1021, 1000, 1074),
+        (1003, 1021, 1087, 1074),
+    ]
 
     values1 = [
         f"{fighter1['wins']}-{fighter1['losses']}",
@@ -642,24 +662,52 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
     ]
 
     for box, value in zip(left_boxes, values1):
-        _cover_value_area(draw, box)
-        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 25, 13)
-        _draw_centered(draw, box, value, fnt, fill=(246, 246, 246), stroke=1)
+        _cover_value_area(draw, box, fill=(7, 7, 7))
+        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 31, 16)
+        _draw_centered(draw, box, value, fnt, fill=(252, 252, 252), stroke=1)
     for box, value in zip(right_boxes, values2):
-        _cover_value_area(draw, box)
-        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 25, 13)
-        _draw_centered(draw, box, value, fnt, fill=(246, 246, 246), stroke=1)
+        _cover_value_area(draw, box, fill=(7, 7, 7))
+        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 31, 16)
+        _draw_centered(draw, box, value, fnt, fill=(252, 252, 252), stroke=1)
 
-    # Bout type text beneath the division-specific title.
+    # The AI-generated template can warp the division wording. Cover that
+    # entire label and redraw the official division text deterministically.
+    division_panel = (286, 1090, 836, 1180)
+    _draw_panel(draw, division_panel, fill=(8, 8, 8), outline=(214, 170, 72), width=3)
+
+    division_text = f"{division.upper()} DIVISION"
+    division_font = _fit_font(draw, division_text, 500, 38, 22)
+    _draw_centered(
+        draw,
+        (305, 1098, 817, 1145),
+        division_text,
+        division_font,
+        fill=(235, 190, 82),
+        stroke=2,
+    )
+
     bout_text = "CHAMPIONSHIP BOUT" if booking["bout_type"] == "championship" else "REGULAR BOUT"
-    _cover_value_area(draw, (392, 1149, 730, 1181))
-    bout_font = _fit_font(draw, bout_text, 320, 24, 14)
-    _draw_centered(draw, (398, 1150, 724, 1180), bout_text, bout_font, fill=(245, 245, 245), stroke=1)
+    bout_font = _fit_font(draw, bout_text, 390, 24, 16)
+    _draw_centered(
+        draw,
+        (360, 1140, 762, 1172),
+        bout_text,
+        bout_font,
+        fill=(248, 248, 248),
+        stroke=1,
+    )
 
-    # Small booking identifier for auditability without changing the poster layout.
+    # Booking ID remains small but readable for commissioner audit/troubleshooting.
     booking_text = f"BOOKING #{booking['id']}"
-    booking_font = _load_osbl_font(16, bold=True)
-    draw.text((18, 1368), booking_text, font=booking_font, fill=(214, 170, 72), stroke_width=1, stroke_fill=(0, 0, 0))
+    booking_font = _load_osbl_font(18, bold=True)
+    draw.text(
+        (18, 1365),
+        booking_text,
+        font=booking_font,
+        fill=(214, 170, 72),
+        stroke_width=1,
+        stroke_fill=(0, 0, 0),
+    )
 
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
