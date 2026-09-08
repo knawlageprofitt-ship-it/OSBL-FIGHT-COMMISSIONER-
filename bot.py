@@ -1,6 +1,7 @@
 
 import os
 import io
+from pathlib import Path
 import discord
 import asyncpg
 from discord.ext import commands
@@ -441,6 +442,7 @@ async def systemcheck(ctx):
         "matchupcheck",
         "bookfight",
         "fightcard",
+        "fightposter",
         "lockfight",
         "cancelbookedfight",
         "setfighterphoto",
@@ -459,7 +461,7 @@ async def systemcheck(ctx):
             + ", ".join(f"`!{name}`" for name in missing_commands)
         )
     else:
-        checks.append("✅ Core result/undo/matchmaking/photo commands registered")
+        checks.append("✅ Core result/undo/matchmaking/photo/poster commands registered")
 
     healthy = not warnings
     embed = discord.Embed(
@@ -499,6 +501,245 @@ async def systemcheck(ctx):
 
     embed.set_footer(text=f"Requested by {ctx.author.display_name} • Read-only diagnostic")
     await ctx.send(embed=embed)
+
+
+
+
+# =========================================================
+# OSBL AUTOMATIC FIGHT POSTER RENDERER
+# Uses one locked master template per weight class.
+# =========================================================
+
+FIGHT_CARD_TEMPLATE_FILES = {
+    "Lightweight": "osbl_lightweight_fight_card.png",
+    "Middleweight": "osbl_middleweight_fight_card.png",
+    "Heavyweight": "osbl_heavyweight_fight_card.png",
+}
+
+
+def _fight_card_asset_path(filename):
+    return Path(__file__).resolve().parent / filename
+
+
+def _load_osbl_font(size, bold=True):
+    """Load a bold condensed-ish system font when available, with safe fallbacks."""
+    from PIL import ImageFont
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ] if bold else [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def _fit_font(draw, text, max_width, start_size, min_size=12):
+    size = start_size
+    while size >= min_size:
+        font = _load_osbl_font(size, bold=True)
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        if bbox[2] - bbox[0] <= max_width:
+            return font
+        size -= 2
+    return _load_osbl_font(min_size, bold=True)
+
+
+def _draw_centered(draw, xy_box, text, font, fill=(245, 245, 245), stroke=2, stroke_fill=(0, 0, 0)):
+    x1, y1, x2, y2 = xy_box
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    x = x1 + ((x2 - x1) - tw) / 2
+    y = y1 + ((y2 - y1) - th) / 2 - bbox[1]
+    draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke, stroke_fill=stroke_fill)
+
+
+def _cover_value_area(draw, box):
+    # Near-black cover keeps the generated template texture feeling intact while
+    # hiding placeholder values so live database data can be drawn cleanly.
+    draw.rectangle(box, fill=(8, 8, 8))
+
+
+def _paste_fighter_portrait(canvas, photo_bytes, box):
+    from PIL import Image, ImageOps, ImageEnhance
+
+    portrait = Image.open(io.BytesIO(bytes(photo_bytes))).convert("RGB")
+    x1, y1, x2, y2 = box
+    portrait = ImageOps.fit(
+        portrait,
+        (x2 - x1, y2 - y1),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.42),
+    )
+    # Slight contrast boost helps varied RP screenshots/photos sit naturally in
+    # the high-contrast arena template.
+    portrait = ImageEnhance.Contrast(portrait).enhance(1.05)
+    canvas.paste(portrait, (x1, y1))
+
+
+def _render_osbl_fight_poster(booking, fighter1, fighter2):
+    """Return a PNG BytesIO for a locked OSBL matchup."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt.") from exc
+
+    division = booking["division"]
+    template_filename = FIGHT_CARD_TEMPLATE_FILES.get(division)
+    if not template_filename:
+        raise RuntimeError(f"No fight-card template is configured for {division}.")
+
+    template_path = _fight_card_asset_path(template_filename)
+    if not template_path.exists():
+        raise RuntimeError(f"Missing template file: {template_filename}")
+
+    canvas = Image.open(template_path).convert("RGB")
+    if canvas.size != (1122, 1402):
+        canvas = canvas.resize((1122, 1402), Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(canvas)
+
+    # Portrait windows inside the existing gold frames.
+    _paste_fighter_portrait(canvas, fighter1["photo_data"], (31, 372, 451, 891))
+    _paste_fighter_portrait(canvas, fighter2["photo_data"], (671, 372, 1091, 891))
+
+    # Name bands.
+    _cover_value_area(draw, (36, 899, 447, 963))
+    _cover_value_area(draw, (676, 899, 1087, 963))
+    name1 = str(fighter1["fighter_name"]).upper()
+    name2 = str(fighter2["fighter_name"]).upper()
+    font1 = _fit_font(draw, name1, 385, 38, 20)
+    font2 = _fit_font(draw, name2, 385, 38, 20)
+    _draw_centered(draw, (39, 902, 444, 960), name1, font1, fill=(248, 248, 248), stroke=2)
+    _draw_centered(draw, (679, 902, 1084, 960), name2, font2, fill=(248, 248, 248), stroke=2)
+
+    # Live stat values. Keep the template's printed labels, replace only values.
+    stat_y = (1030, 1074)
+    left_boxes = [(39, stat_y[0], 126, stat_y[1]), (128, stat_y[0], 214, stat_y[1]), (217, stat_y[0], 360, stat_y[1]), (363, stat_y[0], 445, stat_y[1])]
+    right_boxes = [(679, stat_y[0], 766, stat_y[1]), (768, stat_y[0], 854, stat_y[1]), (857, stat_y[0], 1000, stat_y[1]), (1003, stat_y[0], 1087, stat_y[1])]
+
+    values1 = [
+        f"{fighter1['wins']}-{fighter1['losses']}",
+        str(fighter1["rp"]),
+        str(fighter1["progression_rank"] or "--").upper(),
+        f"#{fighter1['division_rank']}" if fighter1["division_rank"] else "--",
+    ]
+    values2 = [
+        f"{fighter2['wins']}-{fighter2['losses']}",
+        str(fighter2["rp"]),
+        str(fighter2["progression_rank"] or "--").upper(),
+        f"#{fighter2['division_rank']}" if fighter2["division_rank"] else "--",
+    ]
+
+    for box, value in zip(left_boxes, values1):
+        _cover_value_area(draw, box)
+        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 25, 13)
+        _draw_centered(draw, box, value, fnt, fill=(246, 246, 246), stroke=1)
+    for box, value in zip(right_boxes, values2):
+        _cover_value_area(draw, box)
+        fnt = _fit_font(draw, value, box[2] - box[0] - 8, 25, 13)
+        _draw_centered(draw, box, value, fnt, fill=(246, 246, 246), stroke=1)
+
+    # Bout type text beneath the division-specific title.
+    bout_text = "CHAMPIONSHIP BOUT" if booking["bout_type"] == "championship" else "REGULAR BOUT"
+    _cover_value_area(draw, (392, 1149, 730, 1181))
+    bout_font = _fit_font(draw, bout_text, 320, 24, 14)
+    _draw_centered(draw, (398, 1150, 724, 1180), bout_text, bout_font, fill=(245, 245, 245), stroke=1)
+
+    # Small booking identifier for auditability without changing the poster layout.
+    booking_text = f"BOOKING #{booking['id']}"
+    booking_font = _load_osbl_font(16, bold=True)
+    draw.text((18, 1368), booking_text, font=booking_font, fill=(214, 170, 72), stroke_width=1, stroke_fill=(0, 0, 0))
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+async def _send_locked_fight_poster(ctx, booking_id):
+    async with bot.db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT b.*,
+                   f1.fighter_name AS f1_name, f1.wins AS f1_wins, f1.losses AS f1_losses,
+                   f1.rp AS f1_rp, f1.progression_rank AS f1_progression,
+                   f1.division_rank AS f1_division_rank, f1.photo_data AS f1_photo,
+                   f2.fighter_name AS f2_name, f2.wins AS f2_wins, f2.losses AS f2_losses,
+                   f2.rp AS f2_rp, f2.progression_rank AS f2_progression,
+                   f2.division_rank AS f2_division_rank, f2.photo_data AS f2_photo
+            FROM fight_bookings b
+            JOIN fighters f1 ON f1.fighter_key = b.fighter1_key
+            JOIN fighters f2 ON f2.fighter_key = b.fighter2_key
+            WHERE b.id = $1
+            """,
+            booking_id,
+        )
+
+    if not row:
+        await ctx.send(f"❌ Booking ID **{booking_id}** was not found.")
+        return False
+    if not row["f1_photo"] or not row["f2_photo"]:
+        await ctx.send(
+            "🖼️ **FIGHT POSTER NOT GENERATED**\n"
+            "Both fighters need locked portraits first. Use `!setfighterphoto Fighter Name`."
+        )
+        return False
+
+    fighter1 = {
+        "fighter_name": row["f1_name"], "wins": row["f1_wins"], "losses": row["f1_losses"],
+        "rp": row["f1_rp"], "progression_rank": row["f1_progression"],
+        "division_rank": row["f1_division_rank"], "photo_data": row["f1_photo"],
+    }
+    fighter2 = {
+        "fighter_name": row["f2_name"], "wins": row["f2_wins"], "losses": row["f2_losses"],
+        "rp": row["f2_rp"], "progression_rank": row["f2_progression"],
+        "division_rank": row["f2_division_rank"], "photo_data": row["f2_photo"],
+    }
+
+    try:
+        poster = _render_osbl_fight_poster(row, fighter1, fighter2)
+    except Exception as exc:
+        print(f"Fight poster generation error for booking {booking_id}: {type(exc).__name__}: {exc}")
+        await ctx.send(
+            "⚠️ **MATCHUP LOCKED, BUT POSTER COULD NOT BE GENERATED**\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
+        return False
+
+    filename = f"osbl_booking_{booking_id}_{row['division'].casefold()}_fight_card.png"
+    poster_file = discord.File(poster, filename=filename)
+    embed = discord.Embed(
+        title="🥊 OSBL OFFICIAL FIGHT CARD",
+        description=(
+            f"**{row['fighter1_name']} vs {row['fighter2_name']}**\n"
+            f"{row['division']} • {row['bout_type'].title()} • Booking #{booking_id}\n"
+            "🔒 **OFFICIAL MATCHUP LOCKED**"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
+    await ctx.send(embed=embed, file=poster_file)
+    return True
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightposter(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use `!fightposter <Booking ID>`")
+        return
+    await _send_locked_fight_poster(ctx, booking_id)
 
 
 # =========================================================
@@ -786,6 +1027,9 @@ async def lockfight(ctx, booking_id: int = None):
         f"{booking['division']} • {booking['bout_type'].title()}\n"
         f"Assigned to: **{session_text}**"
     )
+
+    # Automatically generate the division-specific visual card when both portraits are locked.
+    await _send_locked_fight_poster(ctx, booking_id)
 
 
 @bot.command()
