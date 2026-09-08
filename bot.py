@@ -443,6 +443,7 @@ async def systemcheck(ctx):
         "bookfight",
         "fightcard",
         "fightposter",
+        "fightposterall",
         "lockfight",
         "cancelbookedfight",
         "setfighterphoto",
@@ -740,6 +741,47 @@ async def fightposter(ctx, booking_id: int = None):
         await ctx.send("❌ Use `!fightposter <Booking ID>`")
         return
     await _send_locked_fight_poster(ctx, booking_id)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightposterall(ctx):
+    """Generate official posters for every currently locked matchup."""
+    async with bot.db.acquire() as conn:
+        bookings = await conn.fetch(
+            """
+            SELECT id
+            FROM fight_bookings
+            WHERE status = 'locked'
+            ORDER BY id ASC
+            """
+        )
+
+    if not bookings:
+        await ctx.send(
+            "📭 **NO LOCKED MATCHUPS**\n"
+            "There are no locked fights available for poster generation."
+        )
+        return
+
+    await ctx.send(
+        f"🎨 **OSBL FIGHT POSTER BATCH**\nGenerating **{len(bookings)}** locked matchup poster(s)..."
+    )
+
+    generated = 0
+    failed = 0
+    for booking in bookings:
+        ok = await _send_locked_fight_poster(ctx, booking["id"])
+        if ok:
+            generated += 1
+        else:
+            failed += 1
+
+    await ctx.send(
+        "✅ **POSTER BATCH COMPLETE**\n"
+        f"Generated: **{generated}**\n"
+        f"Skipped/Failed: **{failed}**"
+    )
 
 
 # =========================================================
