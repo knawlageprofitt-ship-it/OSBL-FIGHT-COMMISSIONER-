@@ -333,7 +333,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V4-FONT-FIX-2026-09-07"
+POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -525,6 +525,8 @@ FIGHT_CARD_TEMPLATE_FILES = {
     "Heavyweight": "osbl_heavyweight_fight_card.png",
 }
 
+CHAMPIONSHIP_TEMPLATE_FILE = "osbl_championship_fight_card.png"
+
 
 def _fight_card_asset_path(filename):
     return Path(__file__).resolve().parent / filename
@@ -610,12 +612,114 @@ def _paste_fighter_portrait(canvas, photo_bytes, box):
     canvas.paste(portrait, (x1, y1))
 
 
+def _render_osbl_championship_poster(booking, fighter1, fighter2):
+    """Render the premium OSBL championship poster using the locked master template."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt.") from exc
+
+    template_path = _fight_card_asset_path(CHAMPIONSHIP_TEMPLATE_FILE)
+    if not template_path.exists():
+        raise RuntimeError(f"Missing championship template file: {CHAMPIONSHIP_TEMPLATE_FILE}")
+
+    canvas = Image.open(template_path).convert("RGB")
+    if canvas.size != (1024, 1536):
+        canvas = canvas.resize((1024, 1536), Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(canvas)
+
+    # Always place the defending champion on the left when one exists.
+    left, right = fighter1, fighter2
+    if fighter2.get("champion") and not fighter1.get("champion"):
+        left, right = fighter2, fighter1
+
+    gold = (232, 188, 80)
+    white = (252, 252, 252)
+    black = (5, 5, 5)
+
+    # Portrait windows stay inside the premium gold frame.
+    _paste_fighter_portrait(canvas, left["photo_data"], (25, 367, 413, 711))
+    _paste_fighter_portrait(canvas, right["photo_data"], (611, 367, 999, 711))
+
+    # Fighter role bars. Covers baked sample wording and redraws live roles.
+    left_role = "DEFENDING CHAMPION" if left.get("champion") else "TITLE CONTENDER"
+    right_role = "CHALLENGER" if left.get("champion") else "TITLE CONTENDER"
+    _draw_panel(draw, (36, 705, 401, 752), fill=black, outline=gold, width=3)
+    _draw_panel(draw, (623, 705, 988, 752), fill=black, outline=gold, width=3)
+    role_font_l = _fit_font(draw, left_role, 330, 25, 16)
+    role_font_r = _fit_font(draw, right_role, 330, 25, 16)
+    _draw_centered(draw, (48, 712, 389, 745), left_role, role_font_l, fill=gold, stroke=1)
+    _draw_centered(draw, (635, 712, 976, 745), right_role, role_font_r, fill=gold, stroke=1)
+
+    # Large fighter names.
+    _draw_panel(draw, (24, 751, 414, 817), fill=black, outline=gold, width=3)
+    _draw_panel(draw, (610, 751, 1000, 817), fill=black, outline=gold, width=3)
+    left_name = str(left["fighter_name"]).upper()
+    right_name = str(right["fighter_name"]).upper()
+    lf = _fit_font(draw, left_name, 350, 38, 22)
+    rf = _fit_font(draw, right_name, 350, 38, 22)
+    _draw_centered(draw, (39, 759, 399, 808), left_name, lf, fill=white, stroke=2)
+    _draw_centered(draw, (625, 759, 985, 808), right_name, rf, fill=white, stroke=2)
+
+    # Championship stat panels.
+    left_stats = (24, 817, 414, 908)
+    right_stats = (610, 817, 1000, 908)
+    for panel in (left_stats, right_stats):
+        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
+
+    def draw_champ_stats(panel, fighter):
+        x1, y1, x2, y2 = panel
+        labels = ["RECORD", "RP", "PROGRESSION", "DIVISION RANK"]
+        values = [
+            f"{fighter['wins']}-{fighter['losses']}",
+            str(fighter["rp"]),
+            str(fighter["progression_rank"] or "--").upper(),
+            f"#{fighter['division_rank']}" if fighter["division_rank"] else "--",
+        ]
+        widths = [0.22, 0.18, 0.37, 0.23]
+        px = x1 + 6
+        usable = (x2 - x1) - 12
+        for i, (label, value, frac) in enumerate(zip(labels, values, widths)):
+            cw = int(usable * frac)
+            if i:
+                draw.line((px, y1 + 10, px, y2 - 10), fill=(125, 98, 42), width=1)
+            lfont = _fit_font(draw, label, cw - 6, 14, 10)
+            vfont = _fit_font(draw, value, cw - 6, 24, 15)
+            _draw_centered(draw, (px+2, y1+7, px+cw-2, y1+36), label, lfont, fill=gold, stroke=1)
+            _draw_centered(draw, (px+2, y1+39, px+cw-2, y2-6), value, vfont, fill=white, stroke=1)
+            px += cw
+
+    draw_champ_stats(left_stats, left)
+    draw_champ_stats(right_stats, right)
+
+    # Rebuild the championship title strip so every division is dynamic.
+    _draw_panel(draw, (94, 1000, 930, 1120), fill=black, outline=gold, width=4)
+    title_text = "CHAMPIONSHIP FIGHT"
+    title_font = _fit_font(draw, title_text, 760, 58, 34)
+    _draw_centered(draw, (115, 1007, 909, 1067), title_text, title_font, fill=gold, stroke=2)
+    division_text = f"{booking['division'].upper()} CHAMPIONSHIP"
+    div_font = _fit_font(draw, division_text, 700, 32, 20)
+    _draw_centered(draw, (150, 1064, 874, 1106), division_text, div_font, fill=white, stroke=1)
+
+    # Audit marker only; keep it discreet.
+    audit_font = _load_osbl_font(16, bold=True)
+    draw.text((26, 1490), f"BOOKING #{booking['id']}", font=audit_font, fill=gold, stroke_width=1, stroke_fill=(0,0,0))
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
 def _render_osbl_fight_poster(booking, fighter1, fighter2):
     """Return a polished PNG BytesIO for an OSBL matchup."""
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
         raise RuntimeError("Pillow is not installed. Add Pillow to requirements.txt.") from exc
+
+    if booking["bout_type"] == "championship":
+        return _render_osbl_championship_poster(booking, fighter1, fighter2)
 
     division = booking["division"]
     template_filename = FIGHT_CARD_TEMPLATE_FILES.get(division)
@@ -715,10 +819,12 @@ async def _send_locked_fight_poster(ctx, booking_id):
             SELECT b.*,
                    f1.fighter_name AS f1_name, f1.wins AS f1_wins, f1.losses AS f1_losses,
                    f1.rp AS f1_rp, f1.progression_rank AS f1_progression,
-                   f1.division_rank AS f1_division_rank, f1.photo_data AS f1_photo,
+                   f1.division_rank AS f1_division_rank, f1.champion AS f1_champion,
+                   f1.title_defenses AS f1_title_defenses, f1.photo_data AS f1_photo,
                    f2.fighter_name AS f2_name, f2.wins AS f2_wins, f2.losses AS f2_losses,
                    f2.rp AS f2_rp, f2.progression_rank AS f2_progression,
-                   f2.division_rank AS f2_division_rank, f2.photo_data AS f2_photo
+                   f2.division_rank AS f2_division_rank, f2.champion AS f2_champion,
+                   f2.title_defenses AS f2_title_defenses, f2.photo_data AS f2_photo
             FROM fight_bookings b
             JOIN fighters f1 ON f1.fighter_key = b.fighter1_key
             JOIN fighters f2 ON f2.fighter_key = b.fighter2_key
@@ -740,12 +846,14 @@ async def _send_locked_fight_poster(ctx, booking_id):
     fighter1 = {
         "fighter_name": row["f1_name"], "wins": row["f1_wins"], "losses": row["f1_losses"],
         "rp": row["f1_rp"], "progression_rank": row["f1_progression"],
-        "division_rank": row["f1_division_rank"], "photo_data": row["f1_photo"],
+        "division_rank": row["f1_division_rank"], "champion": row["f1_champion"],
+        "title_defenses": row["f1_title_defenses"], "photo_data": row["f1_photo"],
     }
     fighter2 = {
         "fighter_name": row["f2_name"], "wins": row["f2_wins"], "losses": row["f2_losses"],
         "rp": row["f2_rp"], "progression_rank": row["f2_progression"],
-        "division_rank": row["f2_division_rank"], "photo_data": row["f2_photo"],
+        "division_rank": row["f2_division_rank"], "champion": row["f2_champion"],
+        "title_defenses": row["f2_title_defenses"], "photo_data": row["f2_photo"],
     }
 
     try:
