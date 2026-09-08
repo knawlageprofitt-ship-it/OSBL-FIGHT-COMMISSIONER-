@@ -333,7 +333,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V3-MOBILE-READABLE-2026-09-07"
+POSTER_RENDERER_VERSION = "V4-FONT-FIX-2026-09-07"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -549,7 +549,14 @@ def _load_osbl_font(size, bold=True):
             return ImageFont.truetype(font_path, size=size)
         except OSError:
             pass
-    return ImageFont.load_default()
+    # Pillow ships a scalable default font in modern versions. Railway images
+    # may not include OS system fonts, so preserve the requested point size
+    # instead of falling back to the old tiny fixed-size bitmap font.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        # Compatibility fallback for older Pillow builds.
+        return ImageFont.load_default()
 
 
 def _fit_font(draw, text, max_width, start_size, min_size=12):
