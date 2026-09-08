@@ -367,6 +367,7 @@ async def systemcheck(ctx):
         "startfightnight",
         "fightnightstatus",
         "fightnightrecap",
+        "fightnightlist",
         "endfightnight",
     ]
 
@@ -665,6 +666,111 @@ async def endfightnight(ctx):
         inline=False,
     )
     embed.set_footer(text="Fight Night session archived in the OSBL database")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def fightnightlist(ctx):
+    """Show the most recent Fight Night sessions and their archived fight counts."""
+    async with bot.db.acquire() as conn:
+        sessions = await conn.fetch(
+            """
+            SELECT *
+            FROM fight_night_sessions
+            ORDER BY id DESC
+            LIMIT 10
+            """
+        )
+
+        if not sessions:
+            await ctx.send(
+                "📚 **NO FIGHT NIGHT SESSIONS FOUND**\n"
+                "A commissioner can open the first one with `!startfightnight`."
+            )
+            return
+
+        session_summaries = []
+        for session in sessions:
+            stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
+                    COUNT(*) FILTER (
+                        WHERE undone = FALSE AND fight_type = 'regular'
+                    ) AS regular_fights,
+                    COUNT(*) FILTER (
+                        WHERE undone = FALSE AND fight_type = 'championship'
+                    ) AS championship_fights,
+                    COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights
+                FROM fight_history fh
+                WHERE
+                    fh.fight_night_session_id = $1
+                    OR (
+                        fh.fight_night_session_id IS NULL
+                        AND fh.id > $2
+                        AND ($3::BIGINT IS NULL OR fh.id <= $3)
+                    )
+                """,
+                session["id"],
+                session["start_history_id"],
+                session["end_history_id"],
+            )
+
+            override_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM result_override_log
+                WHERE overridden_at >= $1
+                  AND ($2::TIMESTAMPTZ IS NULL OR overridden_at <= $2)
+                """,
+                session["started_at"],
+                session["ended_at"],
+            )
+
+            status_icon = "🟢" if session["status"] == "active" else "🔒"
+            status_text = "ACTIVE" if session["status"] == "active" else "CLOSED"
+            started_timestamp = int(session["started_at"].timestamp())
+
+            staff_line = f"Opened by **{session['started_by_name']}**"
+            if session["ended_by_name"]:
+                staff_line += f" • Closed by **{session['ended_by_name']}**"
+
+            session_summaries.append(
+                f"**Session {session['id']}** • {status_icon} **{status_text}**\n"
+                f"{staff_line}\n"
+                f"🕒 <t:{started_timestamp}:f>\n"
+                f"🥊 Official **{stats['official_fights']}** • "
+                f"Regular **{stats['regular_fights']}** • "
+                f"Championship **{stats['championship_fights']}** • "
+                f"Reversed **{stats['reversed_fights']}** • "
+                f"Overrides **{override_count}**\n"
+                f"📜 `!fightnightrecap {session['id']}`"
+            )
+
+    embed = discord.Embed(
+        title="📚 OSBL FIGHT NIGHT ARCHIVE",
+        description="**Most Recent Fight Night Sessions**",
+        color=discord.Color.gold(),
+    )
+
+    # Stay safely under Discord's 1024-character field limit.
+    chunks = []
+    current = ""
+    for summary in session_summaries:
+        addition = summary if not current else "\n\n" + summary
+        if len(current) + len(addition) > 1000:
+            chunks.append(current)
+            current = summary
+        else:
+            current += addition
+    if current:
+        chunks.append(current)
+
+    for index, chunk in enumerate(chunks, start=1):
+        field_name = "🥊 Sessions" if index == 1 else f"🥊 Sessions Continued ({index})"
+        embed.add_field(name=field_name, value=chunk, inline=False)
+
+    embed.set_footer(text="Use !fightnightrecap <Session ID> for the full archived card")
     await ctx.send(embed=embed)
 
 
