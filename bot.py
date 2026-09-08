@@ -1,5 +1,6 @@
 
 import os
+import io
 import discord
 import asyncpg
 from discord.ext import commands
@@ -167,6 +168,36 @@ class OSBLBot(commands.Bot):
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS fight_bookings_session_idx
                 ON fight_bookings (fight_night_session_id);
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_data BYTEA;
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_filename TEXT;
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_content_type TEXT;
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_updated_at TIMESTAMPTZ;
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_locked_by_id BIGINT;
+            """)
+
+            await conn.execute("""
+                ALTER TABLE fighters
+                ADD COLUMN IF NOT EXISTS photo_locked_by_name TEXT;
             """)
 
             await conn.execute("""
@@ -412,6 +443,9 @@ async def systemcheck(ctx):
         "fightcard",
         "lockfight",
         "cancelbookedfight",
+        "setfighterphoto",
+        "fighterphoto",
+        "removefighterphoto",
     ]
 
     missing_commands = []
@@ -425,7 +459,7 @@ async def systemcheck(ctx):
             + ", ".join(f"`!{name}`" for name in missing_commands)
         )
     else:
-        checks.append("✅ Core result/undo/matchmaking commands registered")
+        checks.append("✅ Core result/undo/matchmaking/photo commands registered")
 
     healthy = not warnings
     embed = discord.Embed(
@@ -804,10 +838,17 @@ async def fightcard(ctx):
         )
         rows = await conn.fetch(
             """
-            SELECT *
-            FROM fight_bookings
-            WHERE status IN ('booked', 'locked')
-            ORDER BY CASE WHEN status = 'locked' THEN 0 ELSE 1 END, id ASC
+            SELECT
+                b.*,
+                f1.photo_data AS fighter1_photo_data,
+                f1.photo_filename AS fighter1_photo_filename,
+                f2.photo_data AS fighter2_photo_data,
+                f2.photo_filename AS fighter2_photo_filename
+            FROM fight_bookings b
+            LEFT JOIN fighters f1 ON f1.fighter_key = b.fighter1_key
+            LEFT JOIN fighters f2 ON f2.fighter_key = b.fighter2_key
+            WHERE b.status IN ('booked', 'locked')
+            ORDER BY CASE WHEN b.status = 'locked' THEN 0 ELSE 1 END, b.id ASC
             LIMIT 20
             """
         )
@@ -824,8 +865,9 @@ async def fightcard(ctx):
             if row["fight_night_session_id"]
             else "Unassigned"
         )
+        photo_icon = "📸" if row["fighter1_photo_data"] and row["fighter2_photo_data"] else "🖼️"
         lines.append(
-            f"**#{row['id']}** {status_icon} **{row['fighter1_name']} vs {row['fighter2_name']}**\n"
+            f"**#{row['id']}** {status_icon} **{row['fighter1_name']} vs {row['fighter2_name']}** {photo_icon}\n"
             f"{row['division']} • {row['bout_type'].title()} • {session_text}"
         )
 
@@ -840,8 +882,48 @@ async def fightcard(ctx):
             value=f"Session **{active_session}**",
             inline=False,
         )
-    embed.set_footer(text="🟡 Booked • 🔒 Locked")
+    embed.set_footer(text="🟡 Booked • 🔒 Locked • 📸 Both fighter portraits locked")
     await ctx.send(embed=embed)
+
+    # Send locked fighter portraits for each matchup. Images are stored in PostgreSQL,
+    # so they survive Railway redeploys and do not depend on temporary Discord URLs.
+    for row in rows:
+        portrait_embeds = []
+        files = []
+
+        def safe_ext(filename):
+            filename = filename or "fighter.png"
+            ext = os.path.splitext(filename)[1].lower()
+            return ext if ext in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
+
+        if row["fighter1_photo_data"]:
+            filename1 = f"booking_{row['id']}_fighter1{safe_ext(row['fighter1_photo_filename'])}"
+            files.append(discord.File(io.BytesIO(bytes(row["fighter1_photo_data"])), filename=filename1))
+            e1 = discord.Embed(
+                title=f"🥊 {row['fighter1_name']}",
+                description=f"Booking #{row['id']} • {row['division']} • {row['bout_type'].title()}",
+                color=discord.Color.gold(),
+            )
+            e1.set_image(url=f"attachment://{filename1}")
+            portrait_embeds.append(e1)
+
+        if row["fighter2_photo_data"]:
+            filename2 = f"booking_{row['id']}_fighter2{safe_ext(row['fighter2_photo_filename'])}"
+            files.append(discord.File(io.BytesIO(bytes(row["fighter2_photo_data"])), filename=filename2))
+            e2 = discord.Embed(
+                title=f"🥊 {row['fighter2_name']}",
+                description=f"Booking #{row['id']} • {row['division']} • {row['bout_type'].title()}",
+                color=discord.Color.gold(),
+            )
+            e2.set_image(url=f"attachment://{filename2}")
+            portrait_embeds.append(e2)
+
+        if portrait_embeds:
+            await ctx.send(
+                content=f"📸 **OFFICIAL MATCHUP PORTRAITS — Booking #{row['id']}**",
+                embeds=portrait_embeds,
+                files=files,
+            )
 
 
 # =========================================================
@@ -1343,6 +1425,176 @@ async def fightnightrecap(ctx, session_id: int = None):
     )
     embed.set_footer(text="Use !fightnightrecap <Session ID> to review archived Fight Nights")
     await ctx.send(embed=embed)
+
+
+# =========================================================
+# FIGHTER PHOTO REGISTRY
+# Permanent portrait storage in PostgreSQL
+# =========================================================
+
+ALLOWED_FIGHTER_PHOTO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_FIGHTER_PHOTO_BYTES = 4 * 1024 * 1024
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def setfighterphoto(ctx, *, fighter_name: str = None):
+    if not fighter_name:
+        await ctx.send(
+            "❌ **PHOTO FORMAT**\n"
+            "Attach one fighter image, then use:\n"
+            "`!setfighterphoto Fighter Name`"
+        )
+        return
+
+    if len(ctx.message.attachments) != 1:
+        await ctx.send(
+            "❌ Attach **exactly one** fighter image to the same message as "
+            "`!setfighterphoto Fighter Name`."
+        )
+        return
+
+    attachment = ctx.message.attachments[0]
+    ext = os.path.splitext(attachment.filename or "")[1].lower()
+    content_type = (attachment.content_type or "").lower()
+
+    if ext not in ALLOWED_FIGHTER_PHOTO_EXTENSIONS and not content_type.startswith("image/"):
+        await ctx.send("❌ Fighter photos must be PNG, JPG/JPEG, or WEBP images.")
+        return
+
+    if attachment.size and attachment.size > MAX_FIGHTER_PHOTO_BYTES:
+        await ctx.send("❌ Fighter photo is too large. Maximum size is **4 MB**.")
+        return
+
+    fighter_key = fighter_name.casefold().strip()
+    fighter = await bot.db.fetchrow(
+        "SELECT fighter_name FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not fighter:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+
+    try:
+        photo_bytes = await attachment.read()
+    except Exception:
+        await ctx.send("❌ I could not read that image attachment. Please try attaching it again.")
+        return
+
+    if not photo_bytes or len(photo_bytes) > MAX_FIGHTER_PHOTO_BYTES:
+        await ctx.send("❌ Fighter photo could not be saved or exceeds the **4 MB** limit.")
+        return
+
+    await bot.db.execute(
+        """
+        UPDATE fighters
+        SET photo_data = $1,
+            photo_filename = $2,
+            photo_content_type = $3,
+            photo_updated_at = NOW(),
+            photo_locked_by_id = $4,
+            photo_locked_by_name = $5,
+            updated_at = NOW()
+        WHERE fighter_key = $6
+        """,
+        photo_bytes,
+        attachment.filename,
+        attachment.content_type or "application/octet-stream",
+        ctx.author.id,
+        ctx.author.display_name,
+        fighter_key,
+    )
+
+    preview_name = f"fighter_photo{ext if ext in ALLOWED_FIGHTER_PHOTO_EXTENSIONS else '.png'}"
+    preview = discord.File(io.BytesIO(photo_bytes), filename=preview_name)
+    embed = discord.Embed(
+        title="🔒 OSBL FIGHTER PHOTO LOCKED",
+        description=f"**{fighter['fighter_name']}** now has an official locked character portrait.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Locked By", value=ctx.author.display_name, inline=False)
+    embed.add_field(
+        name="Fight Card",
+        value="This portrait will automatically appear when the fighter is on `!fightcard`.",
+        inline=False,
+    )
+    embed.set_image(url=f"attachment://{preview_name}")
+    await ctx.send(embed=embed, file=preview)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fighterphoto(ctx, *, fighter_name: str = None):
+    if not fighter_name:
+        await ctx.send("❌ Use `!fighterphoto Fighter Name`")
+        return
+
+    fighter = await bot.db.fetchrow(
+        """
+        SELECT fighter_name, division, gym, photo_data, photo_filename,
+               photo_updated_at, photo_locked_by_name
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        fighter_name.casefold().strip(),
+    )
+    if not fighter:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+    if not fighter["photo_data"]:
+        await ctx.send(f"🖼️ **{fighter['fighter_name']}** does not have a locked fighter photo yet.")
+        return
+
+    ext = os.path.splitext(fighter["photo_filename"] or "")[1].lower()
+    if ext not in ALLOWED_FIGHTER_PHOTO_EXTENSIONS:
+        ext = ".png"
+    filename = f"fighter_photo{ext}"
+    photo_file = discord.File(io.BytesIO(bytes(fighter["photo_data"])), filename=filename)
+    embed = discord.Embed(
+        title="📸 OSBL OFFICIAL FIGHTER PHOTO",
+        description=f"**{fighter['fighter_name']}**\n{fighter['division']} • {fighter['gym']}",
+        color=discord.Color.gold(),
+    )
+    if fighter["photo_locked_by_name"]:
+        embed.set_footer(text=f"Locked by {fighter['photo_locked_by_name']}")
+    embed.set_image(url=f"attachment://{filename}")
+    await ctx.send(embed=embed, file=photo_file)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def removefighterphoto(ctx, *, fighter_name: str = None):
+    if not fighter_name:
+        await ctx.send("❌ Use `!removefighterphoto Fighter Name`")
+        return
+
+    fighter_key = fighter_name.casefold().strip()
+    fighter = await bot.db.fetchrow(
+        "SELECT fighter_name, photo_data FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not fighter:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+    if not fighter["photo_data"]:
+        await ctx.send(f"⚠️ **{fighter['fighter_name']}** does not currently have a locked photo.")
+        return
+
+    await bot.db.execute(
+        """
+        UPDATE fighters
+        SET photo_data = NULL,
+            photo_filename = NULL,
+            photo_content_type = NULL,
+            photo_updated_at = NULL,
+            photo_locked_by_id = NULL,
+            photo_locked_by_name = NULL,
+            updated_at = NOW()
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+    await ctx.send(f"🗑️ Official fighter photo removed for **{fighter['fighter_name']}**.")
 
 
 # =========================================================
