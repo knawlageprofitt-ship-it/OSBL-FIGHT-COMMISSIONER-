@@ -334,6 +334,7 @@ async def osbl(ctx):
 
 
 POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
+RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -451,6 +452,9 @@ async def systemcheck(ctx):
         "setfighterphoto",
         "fighterphoto",
         "removefighterphoto",
+        "rankings",
+        "allrankings",
+        "top10",
     ]
 
     missing_commands = []
@@ -498,6 +502,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🎨 Poster Renderer",
         value=f"**{POSTER_RENDERER_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📊 Rankings System",
+        value=f"**{RANKINGS_SYSTEM_VERSION}**",
         inline=False,
     )
 
@@ -3140,41 +3150,39 @@ async def champions(ctx):
     await ctx.send(embed=embed)
 
 # ============================================
-# OSBL DIVISION RANKINGS
-# FORMAT:
+# OSBL AUTOMATIC DIVISION RANKINGS
+# COMMANDS:
 # !rankings Lightweight
 # !rankings Middleweight
 # !rankings Heavyweight
+# !allrankings
+# !top10 Lightweight
+# !top10 Middleweight
+# !top10 Heavyweight
 # ============================================
 
-@bot.command()
-async def rankings(ctx, *, division: str = None):
+DIVISION_NAME_MAP = {
+    "lightweight": "Lightweight",
+    "middleweight": "Middleweight",
+    "heavyweight": "Heavyweight",
+}
 
+
+def _resolve_division_name(division):
     if not division:
-        await ctx.send(
-            "❌ Use:\n"
-            "`!rankings Lightweight`\n"
-            "`!rankings Middleweight`\n"
-            "`!rankings Heavyweight`"
-        )
-        return
+        return None
+    return DIVISION_NAME_MAP.get(str(division).lower().strip())
 
-    divisions = {
-        "lightweight": "Lightweight",
-        "middleweight": "Middleweight",
-        "heavyweight": "Heavyweight"
-    }
 
-    division_key = division.lower().strip()
+def _eligibility_line(rp):
+    rp = int(rp or 0)
+    if rp >= 140:
+        return "🏆 **TITLE ELIGIBLE**"
+    return f"🔒 **{140 - rp} RP** away from Title Eligibility"
 
-    if division_key not in divisions:
-        await ctx.send(
-            "❌ Division must be **Lightweight, Middleweight, or Heavyweight**."
-        )
-        return
 
-    official_division = divisions[division_key]
-
+async def _fetch_division_rankings(official_division, limit=None):
+    # Always refresh official rankings immediately before display.
     await update_division_rankings(official_division)
 
     champion = await bot.db.fetchrow(
@@ -3183,92 +3191,160 @@ async def rankings(ctx, *, division: str = None):
         FROM fighters
         WHERE division = $1
           AND champion = TRUE
+        ORDER BY rp DESC, wins DESC, losses ASC, fighter_name ASC
         LIMIT 1
         """,
-        official_division
+        official_division,
     )
 
-    fighters = await bot.db.fetch(
-        """
+    query = """
         SELECT *
         FROM fighters
         WHERE division = $1
           AND champion = FALSE
-        ORDER BY division_rank ASC
-        """,
-        official_division
+        ORDER BY division_rank ASC NULLS LAST, rp DESC, wins DESC, losses ASC, fighter_name ASC
+    """
+    args = [official_division]
+    if limit is not None:
+        query += " LIMIT $2"
+        args.append(int(limit))
+
+    fighters = await bot.db.fetch(query, *args)
+    return champion, fighters
+
+
+def _champion_text(champion):
+    if not champion:
+        return "**VACANT**"
+
+    return (
+        f"**{champion['fighter_name']}**\n"
+        f"🏢 Gym: **{champion['gym']}**\n"
+        f"🥊 Record: **{champion['wins']}-{champion['losses']}**\n"
+        f"💎 RP: **{champion['rp']}**\n"
+        f"📈 Progression: **{champion['progression_rank']}**\n"
+        f"🛡️ Title Defenses: **{champion['title_defenses']}**"
     )
 
-    embed = discord.Embed(
-        title=f"🥊 OSBL {official_division.upper()} RANKINGS",
-        description="Official ONESTATE Boxing League division standings",
-        color=discord.Color.gold()
-    )
 
-    if champion:
-        embed.add_field(
-            name="👑 CHAMPION",
-            value=(
-                f"**{champion['fighter_name']}**\n"
-                f"Record: **{champion['wins']}-{champion['losses']}**\n"
-                f"RP: **{champion['rp']}**\n"
-                f"Title Defenses: **{champion['title_defenses']}**"
-            ),
-            inline=False
-        )
-    else:
-        embed.add_field(
-            name="👑 CHAMPION",
-            value="**VACANT**",
-            inline=False
+def _contender_entry(fighter, compact=False):
+    rank = fighter['division_rank'] if fighter['division_rank'] is not None else "—"
+    if compact:
+        return (
+            f"**#{rank} {fighter['fighter_name']}** — "
+            f"{fighter['wins']}-{fighter['losses']} | **{fighter['rp']} RP** | "
+            f"{fighter['progression_rank']}\n"
+            f"🏢 {fighter['gym']} • {_eligibility_line(fighter['rp'])}"
         )
 
-    ranking_lines = [
-    (
-        f"**#{fighter['division_rank']} — {fighter['fighter_name']}**\n"
+    return (
+        f"**#{rank} — {fighter['fighter_name']}**\n"
         f"🏢 Gym: **{fighter['gym']}**\n"
         f"🥊 Record: **{fighter['wins']}-{fighter['losses']}**\n"
         f"💎 RP: **{fighter['rp']}**\n"
         f"📈 Progression: **{fighter['progression_rank']}**\n"
-        f"{'🏆 TITLE ELIGIBLE' if fighter['rp'] >= 140 else '🔒 ' + str(140 - fighter['rp']) + ' RP away from Title Eligibility'}"
+        f"{_eligibility_line(fighter['rp'])}"
     )
-    for fighter in fighters
-]
 
-    ranking_chunks = []
-    current_chunk = ""
 
-    for line in ranking_lines:
-        entry = line + "\n\n"
-
-        if len(current_chunk) + len(entry) > 1000:
-            ranking_chunks.append(current_chunk)
-            current_chunk = entry
+def _chunk_entries(entries, max_chars=950):
+    chunks = []
+    current = ""
+    for entry in entries:
+        piece = entry + "\n\n"
+        if current and len(current) + len(piece) > max_chars:
+            chunks.append(current.rstrip())
+            current = piece
         else:
-            current_chunk += entry
+            current += piece
+    if current:
+        chunks.append(current.rstrip())
+    return chunks
 
-    if current_chunk:
-        ranking_chunks.append(current_chunk)
 
-    if ranking_chunks:
-        for i, chunk in enumerate(ranking_chunks):
-            embed.add_field(
-                name="🥇 CONTENDER RANKINGS" if i == 0 else "🥊 CONTENDER RANKINGS CONT.",
-                value=chunk,
-                inline=False
-            )
+async def _send_division_rankings(ctx, official_division, limit=None, compact=False, heading=None):
+    champion, fighters = await _fetch_division_rankings(official_division, limit=limit)
+
+    title_suffix = heading or "RANKINGS"
+    embed = discord.Embed(
+        title=f"🥊 OSBL {official_division.upper()} {title_suffix}",
+        description=(
+            "Official ONESTATE Boxing League standings • "
+            "Rankings refresh automatically from current RP, record, and champion status."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="👑 CHAMPION",
+        value=_champion_text(champion),
+        inline=False,
+    )
+
+    entries = [_contender_entry(fighter, compact=compact) for fighter in fighters]
+    chunks = _chunk_entries(entries)
+
+    if chunks:
+        for i, chunk in enumerate(chunks):
+            label = "🥇 TOP 10" if limit == 10 and i == 0 else "🥇 CONTENDER RANKINGS"
+            if i > 0:
+                label = "🥊 CONTENDER RANKINGS CONT."
+            embed.add_field(name=label, value=chunk, inline=False)
     else:
         embed.add_field(
             name="🥇 CONTENDER RANKINGS",
             value="No ranked contenders yet.",
-            inline=False
+            inline=False,
         )
 
     embed.set_footer(
-        text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+        text=f"{RANKINGS_SYSTEM_VERSION} • 140+ RP = title eligible • Eligibility does not guarantee a title shot"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def rankings(ctx, *, division: str = None):
+    official_division = _resolve_division_name(division)
+    if not official_division:
+        await ctx.send(
+            "❌ Use:\n"
+            "`!rankings Lightweight`\n"
+            "`!rankings Middleweight`\n"
+            "`!rankings Heavyweight`"
+        )
+        return
+
+    await _send_division_rankings(ctx, official_division)
+
+
+@bot.command()
+async def top10(ctx, *, division: str = None):
+    official_division = _resolve_division_name(division)
+    if not official_division:
+        await ctx.send(
+            "❌ Use:\n"
+            "`!top10 Lightweight`\n"
+            "`!top10 Middleweight`\n"
+            "`!top10 Heavyweight`"
+        )
+        return
+
+    await _send_division_rankings(
+        ctx,
+        official_division,
+        limit=10,
+        compact=True,
+        heading="TOP 10",
     )
 
-    await ctx.send(embed=embed)
+
+@bot.command()
+async def allrankings(ctx):
+    await ctx.send("📊 **OSBL ALL-DIVISION RANKINGS — refreshing official standings...**")
+    for official_division in ("Lightweight", "Middleweight", "Heavyweight"):
+        await _send_division_rankings(ctx, official_division, compact=True)
+
 
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER")
