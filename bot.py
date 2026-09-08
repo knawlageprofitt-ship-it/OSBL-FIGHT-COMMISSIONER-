@@ -336,6 +336,7 @@ async def osbl(ctx):
 POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
+GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -517,6 +518,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🥊 Fighter Profiles",
         value=f"**{FIGHTER_PROFILE_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🏢 Gym System",
+        value=f"**{GYM_SYSTEM_VERSION}**",
         inline=False,
     )
 
@@ -2534,6 +2541,312 @@ async def fighters(ctx, *, division: str = None):
         text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
     )
 
+    await ctx.send(embed=embed)
+
+
+# =========================================================
+# OSBL OFFICIAL GYM SYSTEM
+# COMMANDS:
+# !gym <Gym Name>
+# !gymroster <Gym Name>
+# !gymstats <Gym Name>
+# !gymstandings
+# =========================================================
+
+OFFICIAL_GYMS = {
+    "RADEEMERS": {
+        "promoter": "Dub Radeem",
+        "aliases": ("radeemers", "radeemers gym", "radeem team", "the radeem team"),
+    },
+    "ROYAL HITTAZ": {
+        "promoter": "Stormi North",
+        "aliases": ("royal hittaz", "royal hittaz gym", "royal hitttaz"),
+    },
+    "FINESSE TOWN FIGHTERS": {
+        "promoter": "Cheeda Finessa",
+        "aliases": ("finesse town fighters", "finesse town gym", "finesse town"),
+    },
+    "GROVE STREET GOATS": {
+        "promoter": "Mr. Souls",
+        "aliases": ("grove street goats", "grove street goats gym", "grove street goatz", "grove street"),
+    },
+}
+
+
+def _norm_gym_text(value):
+    return " ".join(str(value or "").casefold().strip().split())
+
+
+def _resolve_official_gym(value):
+    key = _norm_gym_text(value)
+    if not key:
+        return None
+    for official, meta in OFFICIAL_GYMS.items():
+        if key == _norm_gym_text(official):
+            return official
+        if key in {_norm_gym_text(x) for x in meta["aliases"]}:
+            return official
+    return None
+
+
+def _fighter_belongs_to_gym(raw_gym, official_gym):
+    raw = _norm_gym_text(raw_gym)
+    if not raw:
+        return False
+    meta = OFFICIAL_GYMS[official_gym]
+    accepted = {_norm_gym_text(official_gym)} | {_norm_gym_text(x) for x in meta["aliases"]}
+    # Allow common stored variants like "RADEEMERS Gym" while avoiding unrelated partial matches.
+    return raw in accepted
+
+
+async def _gym_fighters(official_gym):
+    rows = await bot.db.fetch("SELECT * FROM fighters ORDER BY division, rp DESC, wins DESC, fighter_name ASC")
+    return [row for row in rows if _fighter_belongs_to_gym(row["gym"], official_gym)]
+
+
+async def _gym_snapshot(official_gym):
+    fighters = await _gym_fighters(official_gym)
+    fighter_keys = {row["fighter_key"] for row in fighters}
+
+    wins = sum(int(row["wins"] or 0) for row in fighters)
+    losses = sum(int(row["losses"] or 0) for row in fighters)
+    total_rp = sum(int(row["rp"] or 0) for row in fighters)
+    earnings = sum(int(row["career_earnings"] or 0) for row in fighters)
+    champions = [row for row in fighters if row["champion"]]
+    title_defenses = sum(int(row["title_defenses"] or 0) for row in fighters)
+
+    top_contenders = sum(1 for row in fighters if str(row["progression_rank"] or "").casefold() == "top contender")
+    number_one_contenders = sum(1 for row in fighters if str(row["progression_rank"] or "").casefold() == "#1 contender")
+
+    regular_wins = 0
+    regular_sweeps = 0
+    championship_wins = 0
+    championship_sweeps = 0
+
+    if fighter_keys:
+        history = await bot.db.fetch(
+            """
+            SELECT fight_type, winner_key, score
+            FROM fight_history
+            WHERE undone = FALSE
+            ORDER BY id ASC
+            """
+        )
+        for fight in history:
+            if fight["winner_key"] not in fighter_keys:
+                continue
+            fight_type = str(fight["fight_type"] or "").casefold()
+            score = str(fight["score"] or "").strip()
+            if "champ" in fight_type:
+                championship_wins += 1
+                if score == "3-0":
+                    championship_sweeps += 1
+            else:
+                regular_wins += 1
+                if score == "2-0":
+                    regular_sweeps += 1
+
+    point_parts = {
+        "Regular Wins": regular_wins * 3,
+        "2-0 Sweeps": regular_sweeps * 1,
+        "Championship Wins": championship_wins * 10,
+        "3-0 Championship Sweeps": championship_sweeps * 3,
+        "Title Defenses": title_defenses * 6,
+        "Top Contenders": top_contenders * 3,
+        "#1 Contenders": number_one_contenders * 5,
+        "Active Champions": len(champions) * 8,
+    }
+    gym_points = sum(point_parts.values())
+
+    return {
+        "official_name": official_gym,
+        "promoter": OFFICIAL_GYMS[official_gym]["promoter"],
+        "fighters": fighters,
+        "roster_size": len(fighters),
+        "wins": wins,
+        "losses": losses,
+        "total_rp": total_rp,
+        "earnings": earnings,
+        "champions": champions,
+        "title_defenses": title_defenses,
+        "top_contenders": top_contenders,
+        "number_one_contenders": number_one_contenders,
+        "regular_wins": regular_wins,
+        "regular_sweeps": regular_sweeps,
+        "championship_wins": championship_wins,
+        "championship_sweeps": championship_sweeps,
+        "point_parts": point_parts,
+        "gym_points": gym_points,
+    }
+
+
+async def _all_gym_snapshots():
+    snapshots = []
+    for gym_name in OFFICIAL_GYMS:
+        snapshots.append(await _gym_snapshot(gym_name))
+    snapshots.sort(
+        key=lambda g: (
+            -g["gym_points"],
+            -len(g["champions"]),
+            -g["total_rp"],
+            -g["wins"],
+            g["official_name"],
+        )
+    )
+    for index, snapshot in enumerate(snapshots, start=1):
+        snapshot["gym_rank"] = index
+    return snapshots
+
+
+def _gym_usage():
+    return (
+        "❌ Use one of the official gym names:\n"
+        "**RADEEMERS**\n"
+        "**ROYAL HITTAZ**\n"
+        "**FINESSE TOWN FIGHTERS**\n"
+        "**GROVE STREET GOATS**"
+    )
+
+
+@bot.command()
+async def gymstandings(ctx):
+    snapshots = await _all_gym_snapshots()
+    lines = []
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for g in snapshots:
+        badge = medals.get(g["gym_rank"], f"#{g['gym_rank']}")
+        champ_text = f"{len(g['champions'])} Champ" + ("s" if len(g["champions"]) != 1 else "")
+        lines.append(
+            f"{badge} **{g['official_name']}** — **{g['gym_points']} GP**\n"
+            f"🏆 {champ_text} • 🥊 {g['wins']}-{g['losses']} • 💎 {g['total_rp']} RP • 👥 {g['roster_size']} Fighters"
+        )
+
+    embed = discord.Embed(
+        title="🏢 OSBL OFFICIAL GYM STANDINGS",
+        description="\n\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="📊 Gym Points Formula",
+        value=(
+            "Regular Win **+3** • 2-0 Sweep **+1**\n"
+            "Championship Win **+10** • 3-0 Champ Sweep **+3**\n"
+            "Title Defense **+6** • Top Contender **+3**\n"
+            "#1 Contender **+5** • Active Champion **+8**"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{GYM_SYSTEM_VERSION} • ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gym(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    snapshots = await _all_gym_snapshots()
+    g = next(x for x in snapshots if x["official_name"] == official)
+    champion_names = ", ".join(row["fighter_name"] for row in g["champions"]) or "None"
+
+    embed = discord.Embed(
+        title=f"🏢 OSBL OFFICIAL GYM PROFILE — {official}",
+        description=f"**Gym Rank #{g['gym_rank']}** • **{g['gym_points']} Gym Points**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="🎙️ Leader / Promoter", value=g["promoter"], inline=True)
+    embed.add_field(name="👥 Roster Size", value=str(g["roster_size"]), inline=True)
+    embed.add_field(name="🥊 Combined Record", value=f"{g['wins']}-{g['losses']}", inline=True)
+    embed.add_field(name="💎 Total Fighter RP", value=f"{g['total_rp']} RP", inline=True)
+    embed.add_field(name="👑 Active Champions", value=str(len(g["champions"])), inline=True)
+    embed.add_field(name="🛡️ Title Defenses", value=str(g["title_defenses"]), inline=True)
+    embed.add_field(name="💰 Combined Career Earnings", value=f"${g['earnings']:,}", inline=False)
+    embed.add_field(name="🏆 Champions", value=champion_names, inline=False)
+    embed.set_footer(text=f"{GYM_SYSTEM_VERSION} • Use !gymroster {official} for the roster")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymstats(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    snapshots = await _all_gym_snapshots()
+    g = next(x for x in snapshots if x["official_name"] == official)
+    parts = g["point_parts"]
+    embed = discord.Embed(
+        title=f"📊 OSBL GYM STATS — {official}",
+        description=f"**Gym Rank #{g['gym_rank']} • {g['gym_points']} GP**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🥊 Performance",
+        value=(
+            f"Regular Wins: **{g['regular_wins']}** → +{parts['Regular Wins']} GP\n"
+            f"2-0 Sweeps: **{g['regular_sweeps']}** → +{parts['2-0 Sweeps']} GP\n"
+            f"Championship Wins: **{g['championship_wins']}** → +{parts['Championship Wins']} GP\n"
+            f"3-0 Champ Sweeps: **{g['championship_sweeps']}** → +{parts['3-0 Championship Sweeps']} GP"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏆 Championship / Ranking Bonuses",
+        value=(
+            f"Title Defenses: **{g['title_defenses']}** → +{parts['Title Defenses']} GP\n"
+            f"Top Contenders: **{g['top_contenders']}** → +{parts['Top Contenders']} GP\n"
+            f"#1 Contenders: **{g['number_one_contenders']}** → +{parts['#1 Contenders']} GP\n"
+            f"Active Champions: **{len(g['champions'])}** → +{parts['Active Champions']} GP"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📈 Team Totals",
+        value=f"Record **{g['wins']}-{g['losses']}** • Total RP **{g['total_rp']}** • Earnings **${g['earnings']:,}**",
+        inline=False,
+    )
+    embed.set_footer(text=f"{GYM_SYSTEM_VERSION} • Gym Points update automatically from live OSBL data")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymroster(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    fighters = await _gym_fighters(official)
+    embed = discord.Embed(
+        title=f"🥊 {official} — OFFICIAL GYM ROSTER",
+        description=f"Leader / Promoter: **{OFFICIAL_GYMS[official]['promoter']}**",
+        color=discord.Color.gold(),
+    )
+
+    if not fighters:
+        embed.add_field(name="Roster", value="No fighters currently assigned.", inline=False)
+    else:
+        division_order = ("Lightweight", "Middleweight", "Heavyweight")
+        for division in division_order:
+            division_rows = [row for row in fighters if row["division"] == division]
+            if not division_rows:
+                continue
+            division_rows.sort(key=lambda r: (not bool(r["champion"]), -(int(r["rp"] or 0)), -(int(r["wins"] or 0)), r["fighter_name"]))
+            lines = []
+            for row in division_rows:
+                if row["champion"]:
+                    rank_text = "👑 Champion"
+                else:
+                    rank_text = f"#{row['division_rank']}" if row["division_rank"] else "Unranked"
+                lines.append(
+                    f"**{row['fighter_name']}** — {row['wins']}-{row['losses']} • {row['rp']} RP • {row['progression_rank']} • {rank_text}"
+                )
+            embed.add_field(name=f"🥊 {division}", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text=f"{GYM_SYSTEM_VERSION} • {len(fighters)} fighters")
     await ctx.send(embed=embed)
 
 # ============================================================
