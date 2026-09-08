@@ -333,6 +333,8 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
+POSTER_RENDERER_VERSION = "V2-VERIFY-2026-09-07"
+
 # =========================================================
 # SYSTEM HEALTH CHECK
 # Commissioner-only, read-only diagnostic
@@ -490,6 +492,12 @@ async def systemcheck(ctx):
             f"Commissioner Overrides Logged: **{override_count}**\n"
             f"Pending/Locked Matchups: **{pending_bookings}**"
         ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎨 Poster Renderer",
+        value=f"**{POSTER_RENDERER_VERSION}**",
         inline=False,
     )
 
@@ -772,7 +780,8 @@ async def _send_locked_fight_poster(ctx, booking_id):
         description=(
             f"**{row['fighter1_name']} vs {row['fighter2_name']}**\n"
             f"{row['division']} • {row['bout_type'].title()} • Booking #{booking_id}\n"
-            "🔒 **OFFICIAL MATCHUP LOCKED**"
+            "🔒 **OFFICIAL MATCHUP LOCKED**\n"
+            f"🎨 Renderer: **{POSTER_RENDERER_VERSION}**"
         ),
         color=discord.Color.gold(),
     )
