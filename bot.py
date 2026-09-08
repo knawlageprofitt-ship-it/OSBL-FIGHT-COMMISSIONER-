@@ -137,6 +137,39 @@ class OSBLBot(commands.Bot):
             """)
 
             await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fight_bookings (
+                    id BIGSERIAL PRIMARY KEY,
+                    fighter1_key TEXT NOT NULL,
+                    fighter1_name TEXT NOT NULL,
+                    fighter2_key TEXT NOT NULL,
+                    fighter2_name TEXT NOT NULL,
+                    division TEXT NOT NULL,
+                    bout_type TEXT NOT NULL DEFAULT 'regular',
+                    status TEXT NOT NULL DEFAULT 'booked',
+                    fight_night_session_id BIGINT,
+                    booked_by_id BIGINT NOT NULL,
+                    booked_by_name TEXT NOT NULL,
+                    booked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    locked_by_id BIGINT,
+                    locked_by_name TEXT,
+                    locked_at TIMESTAMPTZ,
+                    cancelled_by_id BIGINT,
+                    cancelled_by_name TEXT,
+                    cancelled_at TIMESTAMPTZ
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS fight_bookings_status_idx
+                ON fight_bookings (status, id);
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS fight_bookings_session_idx
+                ON fight_bookings (fight_night_session_id);
+            """)
+
+            await conn.execute("""
                 ALTER TABLE fight_history
                 ADD COLUMN IF NOT EXISTS fight_night_session_id BIGINT;
             """)
@@ -286,6 +319,7 @@ async def systemcheck(ctx):
         "undo_audit_log",
         "result_override_log",
         "fight_night_sessions",
+        "fight_bookings",
     ]
 
     try:
@@ -319,6 +353,9 @@ async def systemcheck(ctx):
             )
             override_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM result_override_log"
+            )
+            pending_bookings = await conn.fetchval(
+                "SELECT COUNT(*) FROM fight_bookings WHERE status IN ('booked', 'locked')"
             )
 
             # Champion integrity: zero or one champion per division is valid.
@@ -355,6 +392,7 @@ async def systemcheck(ctx):
         active_fights = "?"
         reversed_fights = "?"
         override_count = "?"
+        pending_bookings = "?"
 
     # Verify the core commands are registered in Discord.py.
     core_commands = [
@@ -369,6 +407,11 @@ async def systemcheck(ctx):
         "fightnightrecap",
         "fightnightlist",
         "endfightnight",
+        "matchupcheck",
+        "bookfight",
+        "fightcard",
+        "lockfight",
+        "cancelbookedfight",
     ]
 
     missing_commands = []
@@ -382,7 +425,7 @@ async def systemcheck(ctx):
             + ", ".join(f"`!{name}`" for name in missing_commands)
         )
     else:
-        checks.append("✅ Core result/undo/override commands registered")
+        checks.append("✅ Core result/undo/matchmaking commands registered")
 
     healthy = not warnings
     embed = discord.Embed(
@@ -407,7 +450,8 @@ async def systemcheck(ctx):
             f"Registered Fighters: **{fighter_count}**\n"
             f"Active Fight Records: **{active_fights}**\n"
             f"Reversed Fight Records: **{reversed_fights}**\n"
-            f"Commissioner Overrides Logged: **{override_count}**"
+            f"Commissioner Overrides Logged: **{override_count}**\n"
+            f"Pending/Locked Matchups: **{pending_bookings}**"
         ),
         inline=False,
     )
@@ -420,6 +464,383 @@ async def systemcheck(ctx):
         )
 
     embed.set_footer(text=f"Requested by {ctx.author.display_name} • Read-only diagnostic")
+    await ctx.send(embed=embed)
+
+
+# =========================================================
+# OSBL MATCHMAKING SYSTEM
+# Books, validates, locks, and displays upcoming matchups.
+# =========================================================
+
+async def _matchup_snapshot(fighter1_name, fighter2_name):
+    fighter1_key = fighter1_name.casefold().strip()
+    fighter2_key = fighter2_name.casefold().strip()
+
+    if fighter1_key == fighter2_key:
+        return None, None, "❌ A fighter cannot be matched against themselves."
+
+    async with bot.db.acquire() as conn:
+        fighter1 = await conn.fetchrow(
+            "SELECT * FROM fighters WHERE fighter_key = $1",
+            fighter1_key,
+        )
+        fighter2 = await conn.fetchrow(
+            "SELECT * FROM fighters WHERE fighter_key = $1",
+            fighter2_key,
+        )
+
+    if not fighter1:
+        return None, None, f"❌ **{fighter1_name}** is not registered in OSBL."
+    if not fighter2:
+        return None, None, f"❌ **{fighter2_name}** is not registered in OSBL."
+    if fighter1["division"] != fighter2["division"]:
+        return fighter1, fighter2, "❌ Fighters must be in the same division."
+
+    return fighter1, fighter2, None
+
+
+def _championship_booking_eligibility(fighter1, fighter2):
+    f1_champ = bool(fighter1["champion"])
+    f2_champ = bool(fighter2["champion"])
+
+    if f1_champ and f2_champ:
+        return False, "Both fighters are marked as champions. Run `!systemcheck` before sanctioning."
+
+    if f1_champ or f2_champ:
+        challenger = fighter2 if f1_champ else fighter1
+        if challenger["rp"] < 140:
+            return (
+                False,
+                f"**{challenger['fighter_name']}** has {challenger['rp']} RP. "
+                "OSBL title eligibility begins at **140 RP**.",
+            )
+        return (
+            True,
+            "Champion vs title-eligible challenger. Commissioner sanction is still required; "
+            "140+ RP does not guarantee a title shot.",
+        )
+
+    if fighter1["rp"] >= 140 and fighter2["rp"] >= 140:
+        return (
+            True,
+            "Vacant-title eligibility check passed: both fighters have 140+ RP. "
+            "Commissioner sanction is still required.",
+        )
+
+    return (
+        False,
+        "No active champion is in this matchup, and both fighters are not at 140+ RP.",
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def matchupcheck(ctx, *, details: str = None):
+    if not details:
+        await ctx.send(
+            "❌ **MATCHUP CHECK FORMAT**\n"
+            "`!matchupcheck Fighter One | Fighter Two`"
+        )
+        return
+
+    parts = [part.strip() for part in details.split("|")]
+    if len(parts) != 2:
+        await ctx.send("❌ Use exactly: `!matchupcheck Fighter One | Fighter Two`")
+        return
+
+    fighter1, fighter2, error = await _matchup_snapshot(parts[0], parts[1])
+    if error:
+        await ctx.send(error)
+        return
+
+    champ_ok, champ_reason = _championship_booking_eligibility(fighter1, fighter2)
+
+    embed = discord.Embed(
+        title="🔎 OSBL MATCHUP CHECK",
+        description=f"**{fighter1['division']} Division**",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name=f"🥊 {fighter1['fighter_name']}",
+        value=(
+            f"Record: **{fighter1['wins']}-{fighter1['losses']}**\n"
+            f"RP: **{fighter1['rp']}**\n"
+            f"Progression: **{fighter1['progression_rank']}**\n"
+            f"Division Rank: **{fighter1['division_rank'] or 'Unranked'}**\n"
+            f"Champion: **{'YES' if fighter1['champion'] else 'NO'}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"🥊 {fighter2['fighter_name']}",
+        value=(
+            f"Record: **{fighter2['wins']}-{fighter2['losses']}**\n"
+            f"RP: **{fighter2['rp']}**\n"
+            f"Progression: **{fighter2['progression_rank']}**\n"
+            f"Division Rank: **{fighter2['division_rank'] or 'Unranked'}**\n"
+            f"Champion: **{'YES' if fighter2['champion'] else 'NO'}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ Regular Fight",
+        value="Eligible — same division.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏆 Championship Fight",
+        value=("✅ Eligible for sanction — " if champ_ok else "❌ Not currently eligible — ") + champ_reason,
+        inline=False,
+    )
+    embed.set_footer(text="Read-only eligibility check • Final matchmaking authority remains with OSBL officials")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def bookfight(ctx, *, details: str = None):
+    if not details:
+        await ctx.send(
+            "❌ **BOOK FIGHT FORMAT**\n"
+            "Regular: `!bookfight Fighter One | Fighter Two`\n"
+            "Championship: `!bookfight Fighter One | Fighter Two | championship`"
+        )
+        return
+
+    parts = [part.strip() for part in details.split("|")]
+    if len(parts) not in (2, 3):
+        await ctx.send(
+            "❌ Use `!bookfight Fighter One | Fighter Two` or "
+            "`!bookfight Fighter One | Fighter Two | championship`"
+        )
+        return
+
+    fighter1, fighter2, error = await _matchup_snapshot(parts[0], parts[1])
+    if error:
+        await ctx.send(error)
+        return
+
+    bout_type = "regular"
+    if len(parts) == 3:
+        requested = parts[2].casefold()
+        if requested not in ("regular", "championship", "title"):
+            await ctx.send("❌ Bout type must be **regular** or **championship**.")
+            return
+        bout_type = "championship" if requested in ("championship", "title") else "regular"
+
+    if bout_type == "championship":
+        champ_ok, champ_reason = _championship_booking_eligibility(fighter1, fighter2)
+        if not champ_ok:
+            await ctx.send(f"❌ **CHAMPIONSHIP BOOKING BLOCKED**\n{champ_reason}")
+            return
+
+    async with bot.db.acquire() as conn:
+        conflict = await conn.fetchrow(
+            """
+            SELECT id, fighter1_name, fighter2_name, status
+            FROM fight_bookings
+            WHERE status IN ('booked', 'locked')
+              AND (
+                    fighter1_key = ANY($1::text[])
+                 OR fighter2_key = ANY($1::text[])
+              )
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            [fighter1["fighter_key"], fighter2["fighter_key"]],
+        )
+        if conflict:
+            await ctx.send(
+                "⚠️ **BOOKING CONFLICT**\n"
+                f"Booking ID **{conflict['id']}** is already {conflict['status']}: "
+                f"**{conflict['fighter1_name']} vs {conflict['fighter2_name']}**.\n"
+                "Cancel or complete that booking before creating another for either fighter."
+            )
+            return
+
+        booking = await conn.fetchrow(
+            """
+            INSERT INTO fight_bookings (
+                fighter1_key, fighter1_name,
+                fighter2_key, fighter2_name,
+                division, bout_type,
+                booked_by_id, booked_by_name
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, booked_at
+            """,
+            fighter1["fighter_key"], fighter1["fighter_name"],
+            fighter2["fighter_key"], fighter2["fighter_name"],
+            fighter1["division"], bout_type,
+            ctx.author.id, ctx.author.display_name,
+        )
+
+    embed = discord.Embed(
+        title="📋 OSBL MATCHUP BOOKED",
+        description=f"Booking ID **{booking['id']}**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🥊 Matchup",
+        value=f"**{fighter1['fighter_name']} vs {fighter2['fighter_name']}**",
+        inline=False,
+    )
+    embed.add_field(name="Division", value=fighter1["division"], inline=True)
+    embed.add_field(name="Bout Type", value=bout_type.title(), inline=True)
+    embed.add_field(name="Status", value="🟡 BOOKED — not locked", inline=False)
+    embed.add_field(
+        name="Next Step",
+        value=f"Commissioner: `!lockfight {booking['id']}`",
+        inline=False,
+    )
+    embed.set_footer(text=f"Booked by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def lockfight(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use `!lockfight <Booking ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            booking = await conn.fetchrow(
+                "SELECT * FROM fight_bookings WHERE id = $1 FOR UPDATE",
+                booking_id,
+            )
+            if not booking:
+                await ctx.send(f"❌ Booking ID **{booking_id}** was not found.")
+                return
+            if booking["status"] == "cancelled":
+                await ctx.send("❌ This booking has been cancelled.")
+                return
+            if booking["status"] == "locked":
+                await ctx.send(f"🔒 Booking ID **{booking_id}** is already locked.")
+                return
+
+            session_id = await conn.fetchval(
+                """
+                SELECT id FROM fight_night_sessions
+                WHERE status = 'active'
+                ORDER BY id DESC LIMIT 1
+                """
+            )
+
+            await conn.execute(
+                """
+                UPDATE fight_bookings
+                SET status = 'locked',
+                    fight_night_session_id = COALESCE($1, fight_night_session_id),
+                    locked_by_id = $2,
+                    locked_by_name = $3,
+                    locked_at = NOW()
+                WHERE id = $4
+                """,
+                session_id,
+                ctx.author.id,
+                ctx.author.display_name,
+                booking_id,
+            )
+
+    session_text = f"Fight Night Session **{session_id}**" if session_id else "Next Fight Night (unassigned until session opens)"
+    await ctx.send(
+        f"🔒 **MATCHUP LOCKED**\n"
+        f"Booking ID: **{booking_id}**\n"
+        f"**{booking['fighter1_name']} vs {booking['fighter2_name']}**\n"
+        f"{booking['division']} • {booking['bout_type'].title()}\n"
+        f"Assigned to: **{session_text}**"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def cancelbookedfight(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use `!cancelbookedfight <Booking ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        booking = await conn.fetchrow(
+            "SELECT * FROM fight_bookings WHERE id = $1",
+            booking_id,
+        )
+        if not booking:
+            await ctx.send(f"❌ Booking ID **{booking_id}** was not found.")
+            return
+        if booking["status"] == "cancelled":
+            await ctx.send(f"⚠️ Booking ID **{booking_id}** is already cancelled.")
+            return
+
+        await conn.execute(
+            """
+            UPDATE fight_bookings
+            SET status = 'cancelled',
+                cancelled_by_id = $1,
+                cancelled_by_name = $2,
+                cancelled_at = NOW()
+            WHERE id = $3
+            """,
+            ctx.author.id,
+            ctx.author.display_name,
+            booking_id,
+        )
+
+    await ctx.send(
+        f"🚫 **MATCHUP CANCELLED**\n"
+        f"Booking ID: **{booking_id}**\n"
+        f"**{booking['fighter1_name']} vs {booking['fighter2_name']}**\n"
+        f"Cancelled by **{ctx.author.display_name}**."
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightcard(ctx):
+    async with bot.db.acquire() as conn:
+        active_session = await conn.fetchval(
+            "SELECT id FROM fight_night_sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1"
+        )
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM fight_bookings
+            WHERE status IN ('booked', 'locked')
+            ORDER BY CASE WHEN status = 'locked' THEN 0 ELSE 1 END, id ASC
+            LIMIT 20
+            """
+        )
+
+    if not rows:
+        await ctx.send("📋 **OSBL FIGHT CARD**\nNo active booked matchups.")
+        return
+
+    lines = []
+    for row in rows:
+        status_icon = "🔒" if row["status"] == "locked" else "🟡"
+        session_text = (
+            f"Session {row['fight_night_session_id']}"
+            if row["fight_night_session_id"]
+            else "Unassigned"
+        )
+        lines.append(
+            f"**#{row['id']}** {status_icon} **{row['fighter1_name']} vs {row['fighter2_name']}**\n"
+            f"{row['division']} • {row['bout_type'].title()} • {session_text}"
+        )
+
+    embed = discord.Embed(
+        title="🥊 OSBL OFFICIAL FIGHT CARD",
+        description="\n\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    if active_session:
+        embed.add_field(
+            name="🟢 Active Fight Night",
+            value=f"Session **{active_session}**",
+            inline=False,
+        )
+    embed.set_footer(text="🟡 Booked • 🔒 Locked")
     await ctx.send(embed=embed)
 
 
@@ -472,6 +893,20 @@ async def startfightnight(ctx):
                 start_history_id,
             )
 
+            assigned_bookings = await conn.fetchval(
+                """
+                WITH assigned AS (
+                    UPDATE fight_bookings
+                    SET fight_night_session_id = $1
+                    WHERE status = 'locked'
+                      AND fight_night_session_id IS NULL
+                    RETURNING id
+                )
+                SELECT COUNT(*) FROM assigned
+                """,
+                session["id"],
+            )
+
     embed = discord.Embed(
         title="🥊 OSBL FIGHT NIGHT — SESSION OPEN",
         description="**OFFICIAL FIGHT NIGHT IS NOW ACTIVE**",
@@ -485,8 +920,13 @@ async def startfightnight(ctx):
         inline=False,
     )
     embed.add_field(
+        name="Locked Fight Card",
+        value=f"**{assigned_bookings}** locked matchup(s) assigned to this session",
+        inline=False,
+    )
+    embed.add_field(
         name="Commissioner Commands",
-        value="`!fightnightstatus` • `!endfightnight`",
+        value="`!fightnightstatus` • `!fightcard` • `!endfightnight`",
         inline=False,
     )
     embed.set_footer(text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
