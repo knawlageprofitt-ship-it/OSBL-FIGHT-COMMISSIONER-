@@ -148,6 +148,31 @@ class OSBLBot(commands.Bot):
             """)
 
             await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fight_night_financial_snapshots (
+                    session_id BIGINT PRIMARY KEY REFERENCES fight_night_sessions(id) ON DELETE CASCADE,
+                    official_fights INTEGER NOT NULL DEFAULT 0,
+                    regular_fights INTEGER NOT NULL DEFAULT 0,
+                    championship_fights INTEGER NOT NULL DEFAULT 0,
+                    reversed_fights INTEGER NOT NULL DEFAULT 0,
+                    total_purses BIGINT NOT NULL DEFAULT 0,
+                    regular_purses BIGINT NOT NULL DEFAULT 0,
+                    championship_purses BIGINT NOT NULL DEFAULT 0,
+                    fighters_credited INTEGER NOT NULL DEFAULT 0,
+                    reversed_purse_entries INTEGER NOT NULL DEFAULT 0,
+                    reversed_purse_value BIGINT NOT NULL DEFAULT 0,
+                    cashout_count INTEGER NOT NULL DEFAULT 0,
+                    cashout_total BIGINT NOT NULL DEFAULT 0,
+                    requests_created INTEGER NOT NULL DEFAULT 0,
+                    pending_count INTEGER NOT NULL DEFAULT 0,
+                    pending_total BIGINT NOT NULL DEFAULT 0,
+                    gym_breakdown_json TEXT NOT NULL DEFAULT '{}',
+                    opened_by_name TEXT,
+                    closed_by_name TEXT,
+                    snapshot_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS fight_bookings (
                     id BIGSERIAL PRIMARY KEY,
                     fighter1_key TEXT NOT NULL,
@@ -537,7 +562,7 @@ GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
 FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
-FIGHT_NIGHT_FINANCE_VERSION = "V1-FIGHT-NIGHT-FINANCE-2026-09-09"
+FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -560,6 +585,7 @@ async def systemcheck(ctx):
         "undo_audit_log",
         "result_override_log",
         "fight_night_sessions",
+        "fight_night_financial_snapshots",
         "fight_bookings",
         "gym_settings",
         "gym_management_log",
@@ -1846,6 +1872,169 @@ async def fightnightstatus(ctx):
 
 
 @bot.command()
+
+async def _calculate_fightnight_financial_snapshot(conn, session):
+    """Calculate one session's financial totals from current live data."""
+    is_active = session["status"] == "active"
+
+    ledger_rows = await conn.fetch(
+        """
+        SELECT
+            pl.fighter_key,
+            pl.gym_name,
+            pl.fight_type,
+            pl.amount,
+            pl.status
+        FROM payout_ledger pl
+        WHERE
+            pl.fight_night_session_id = $1
+            OR (
+                pl.fight_night_session_id IS NULL
+                AND pl.fight_history_id > $2
+                AND ($3::BIGINT IS NULL OR pl.fight_history_id <= $3)
+            )
+        """,
+        session["id"],
+        session["start_history_id"],
+        session["end_history_id"],
+    )
+
+    fight_stats = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
+            COUNT(*) FILTER (WHERE undone = FALSE AND fight_type = 'regular') AS regular_fights,
+            COUNT(*) FILTER (WHERE undone = FALSE AND fight_type = 'championship') AS championship_fights,
+            COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights
+        FROM fight_history
+        WHERE
+            fight_night_session_id = $1
+            OR (
+                fight_night_session_id IS NULL
+                AND id > $2
+                AND ($3::BIGINT IS NULL OR id <= $3)
+            )
+        """,
+        session["id"],
+        session["start_history_id"],
+        session["end_history_id"],
+    )
+
+    end_time = session["ended_at"]
+    if is_active:
+        cashout_stats = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS cashout_count,
+                   COALESCE(SUM(amount), 0) AS cashout_total
+            FROM payout_cashouts
+            WHERE created_at >= $1 AND created_at <= NOW()
+            """,
+            session["started_at"],
+        )
+        request_stats = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS requests_created,
+                   COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                   COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total
+            FROM payout_requests
+            WHERE created_at >= $1 AND created_at <= NOW()
+            """,
+            session["started_at"],
+        )
+    else:
+        cashout_stats = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS cashout_count,
+                   COALESCE(SUM(amount), 0) AS cashout_total
+            FROM payout_cashouts
+            WHERE created_at >= $1 AND created_at <= $2
+            """,
+            session["started_at"],
+            end_time,
+        )
+        request_stats = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS requests_created,
+                   COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                   COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total
+            FROM payout_requests
+            WHERE created_at >= $1 AND created_at <= $2
+            """,
+            session["started_at"],
+            end_time,
+        )
+
+    active_rows = [r for r in ledger_rows if r["status"] == "active"]
+    reversed_rows = [r for r in ledger_rows if r["status"] == "reversed"]
+
+    gym_totals = {}
+    for row in active_rows:
+        gym = _resolve_official_gym(row["gym_name"]) or str(row["gym_name"] or "").strip()
+        if not gym:
+            gym = "Independent / No Gym Assigned"
+        gym_totals[gym] = gym_totals.get(gym, 0) + int(row["amount"] or 0)
+
+    return {
+        "official_fights": int(fight_stats["official_fights"] or 0),
+        "regular_fights": int(fight_stats["regular_fights"] or 0),
+        "championship_fights": int(fight_stats["championship_fights"] or 0),
+        "reversed_fights": int(fight_stats["reversed_fights"] or 0),
+        "total_purses": sum(int(r["amount"] or 0) for r in active_rows),
+        "regular_purses": sum(int(r["amount"] or 0) for r in active_rows if str(r["fight_type"]).casefold() == "regular"),
+        "championship_purses": sum(int(r["amount"] or 0) for r in active_rows if str(r["fight_type"]).casefold() == "championship"),
+        "fighters_credited": len({r["fighter_key"] for r in active_rows}),
+        "reversed_purse_entries": len(reversed_rows),
+        "reversed_purse_value": sum(int(r["amount"] or 0) for r in reversed_rows),
+        "cashout_count": int(cashout_stats["cashout_count"] or 0),
+        "cashout_total": int(cashout_stats["cashout_total"] or 0),
+        "requests_created": int(request_stats["requests_created"] or 0),
+        "pending_count": int(request_stats["pending_count"] or 0),
+        "pending_total": int(request_stats["pending_total"] or 0),
+        "gym_totals": gym_totals,
+    }
+
+
+async def _freeze_fightnight_financial_snapshot(conn, session):
+    """Freeze a closed Fight Night's accounting so later cleanup cannot rewrite history."""
+    data = await _calculate_fightnight_financial_snapshot(conn, session)
+
+    await conn.execute(
+        """
+        INSERT INTO fight_night_financial_snapshots (
+            session_id, official_fights, regular_fights, championship_fights,
+            reversed_fights, total_purses, regular_purses, championship_purses,
+            fighters_credited, reversed_purse_entries, reversed_purse_value,
+            cashout_count, cashout_total, requests_created, pending_count,
+            pending_total, gym_breakdown_json, opened_by_name, closed_by_name
+        )
+        VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+        )
+        ON CONFLICT (session_id) DO NOTHING
+        """,
+        session["id"],
+        data["official_fights"],
+        data["regular_fights"],
+        data["championship_fights"],
+        data["reversed_fights"],
+        data["total_purses"],
+        data["regular_purses"],
+        data["championship_purses"],
+        data["fighters_credited"],
+        data["reversed_purse_entries"],
+        data["reversed_purse_value"],
+        data["cashout_count"],
+        data["cashout_total"],
+        data["requests_created"],
+        data["pending_count"],
+        data["pending_total"],
+        json.dumps(data["gym_totals"], sort_keys=True),
+        session["started_by_name"],
+        session["ended_by_name"],
+    )
+    return data
+
+
 @commands.has_any_role("OSBL COMMISSIONER")
 async def endfightnight(ctx):
     async with bot.db.acquire() as conn:
@@ -1910,13 +2099,15 @@ async def endfightnight(ctx):
                     ended_at = NOW(),
                     end_history_id = $3
                 WHERE id = $4
-                RETURNING ended_at
+                RETURNING *
                 """,
                 ctx.author.id,
                 ctx.author.display_name,
                 end_history_id,
                 session["id"],
             )
+
+            await _freeze_fightnight_financial_snapshot(conn, closed)
 
     embed = discord.Embed(
         title="🔒 OSBL FIGHT NIGHT — SESSION CLOSED",
@@ -2059,29 +2250,18 @@ async def fightnightlist(ctx):
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def fightnightfinance(ctx, session_id: int = None):
     """
-    Official financial closeout for one Fight Night session.
-
-    Usage:
-      !fightnightfinance
-      !fightnightfinance <Session ID>
+    Show Fight Night accounting.
+    Active sessions calculate live.
+    Closed sessions use their frozen financial snapshot when available.
     """
     async with bot.db.acquire() as conn:
         if session_id is None:
             session = await conn.fetchrow(
-                """
-                SELECT *
-                FROM fight_night_sessions
-                ORDER BY id DESC
-                LIMIT 1
-                """
+                "SELECT * FROM fight_night_sessions ORDER BY id DESC LIMIT 1"
             )
         else:
             session = await conn.fetchrow(
-                """
-                SELECT *
-                FROM fight_night_sessions
-                WHERE id = $1
-                """,
+                "SELECT * FROM fight_night_sessions WHERE id = $1",
                 session_id,
             )
 
@@ -2092,158 +2272,58 @@ async def fightnightfinance(ctx, session_id: int = None):
             )
             return
 
-        # Financial window is session start through close time.
-        # For an active session, use NOW().
-        window_end = session["ended_at"]
-        is_active = session["status"] == "active"
-
-        # Fight-night purse ledger. Prefer direct session links; retain
-        # compatibility with older results using the session's history range.
-        ledger_rows = await conn.fetch(
-            """
-            SELECT
-                pl.id,
-                pl.fight_history_id,
-                pl.fighter_key,
-                pl.fighter_name,
-                pl.gym_name,
-                pl.division,
-                pl.fight_type,
-                pl.payout_role,
-                pl.amount,
-                pl.status,
-                pl.created_at
-            FROM payout_ledger pl
-            LEFT JOIN fight_history fh ON fh.id = pl.fight_history_id
-            WHERE
-                pl.fight_night_session_id = $1
-                OR (
-                    pl.fight_night_session_id IS NULL
-                    AND pl.fight_history_id > $2
-                    AND ($3::BIGINT IS NULL OR pl.fight_history_id <= $3)
-                )
-            ORDER BY pl.id ASC
-            """,
-            session["id"],
-            session["start_history_id"],
-            session["end_history_id"],
-        )
-
-        # Count official fights and reversed fights in the session.
-        fight_stats = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
-                COUNT(*) FILTER (
-                    WHERE undone = FALSE AND fight_type = 'regular'
-                ) AS regular_fights,
-                COUNT(*) FILTER (
-                    WHERE undone = FALSE AND fight_type = 'championship'
-                ) AS championship_fights,
-                COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights
-            FROM fight_history
-            WHERE
-                fight_night_session_id = $1
-                OR (
-                    fight_night_session_id IS NULL
-                    AND id > $2
-                    AND ($3::BIGINT IS NULL OR id <= $3)
-                )
-            """,
-            session["id"],
-            session["start_history_id"],
-            session["end_history_id"],
-        )
-
-        # Cashouts completed during the actual Fight Night clock window.
-        if is_active:
-            cashout_stats = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) AS cashout_count,
-                    COALESCE(SUM(amount), 0) AS cashout_total
-                FROM payout_cashouts
-                WHERE created_at >= $1
-                  AND created_at <= NOW()
-                """,
-                session["started_at"],
+        snapshot = None
+        if session["status"] == "closed":
+            snapshot = await conn.fetchrow(
+                "SELECT * FROM fight_night_financial_snapshots WHERE session_id = $1",
+                session["id"],
             )
-            request_stats = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
-                    COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total,
-                    COUNT(*) AS requests_created
-                FROM payout_requests
-                WHERE created_at >= $1
-                  AND created_at <= NOW()
-                """,
-                session["started_at"],
-            )
+
+        if snapshot:
+            data = {
+                "official_fights": int(snapshot["official_fights"] or 0),
+                "regular_fights": int(snapshot["regular_fights"] or 0),
+                "championship_fights": int(snapshot["championship_fights"] or 0),
+                "reversed_fights": int(snapshot["reversed_fights"] or 0),
+                "total_purses": int(snapshot["total_purses"] or 0),
+                "regular_purses": int(snapshot["regular_purses"] or 0),
+                "championship_purses": int(snapshot["championship_purses"] or 0),
+                "fighters_credited": int(snapshot["fighters_credited"] or 0),
+                "reversed_purse_entries": int(snapshot["reversed_purse_entries"] or 0),
+                "reversed_purse_value": int(snapshot["reversed_purse_value"] or 0),
+                "cashout_count": int(snapshot["cashout_count"] or 0),
+                "cashout_total": int(snapshot["cashout_total"] or 0),
+                "requests_created": int(snapshot["requests_created"] or 0),
+                "pending_count": int(snapshot["pending_count"] or 0),
+                "pending_total": int(snapshot["pending_total"] or 0),
+                "gym_totals": json.loads(snapshot["gym_breakdown_json"] or "{}"),
+            }
+            source = "🔒 **FROZEN FINANCIAL SNAPSHOT**"
+            opened_by = snapshot["opened_by_name"] or session["started_by_name"]
+            closed_by = snapshot["closed_by_name"] or session["ended_by_name"]
         else:
-            cashout_stats = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) AS cashout_count,
-                    COALESCE(SUM(amount), 0) AS cashout_total
-                FROM payout_cashouts
-                WHERE created_at >= $1
-                  AND created_at <= $2
-                """,
-                session["started_at"],
-                window_end,
-            )
-            request_stats = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
-                    COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total,
-                    COUNT(*) AS requests_created
-                FROM payout_requests
-                WHERE created_at >= $1
-                  AND created_at <= $2
-                """,
-                session["started_at"],
-                window_end,
-            )
-
-    active_rows = [row for row in ledger_rows if row["status"] == "active"]
-    reversed_rows = [row for row in ledger_rows if row["status"] == "reversed"]
-
-    total_purses = sum(int(row["amount"] or 0) for row in active_rows)
-    regular_purses = sum(
-        int(row["amount"] or 0)
-        for row in active_rows
-        if str(row["fight_type"]).casefold() == "regular"
-    )
-    championship_purses = sum(
-        int(row["amount"] or 0)
-        for row in active_rows
-        if str(row["fight_type"]).casefold() == "championship"
-    )
-    reversed_value = sum(int(row["amount"] or 0) for row in reversed_rows)
-    credited_fighters = len({row["fighter_key"] for row in active_rows})
-
-    gym_totals = {}
-    for row in active_rows:
-        gym_name = _resolve_official_gym(row["gym_name"]) or str(row["gym_name"] or "").strip()
-        if not gym_name:
-            gym_name = "Independent / No Gym Assigned"
-        gym_totals[gym_name] = gym_totals.get(gym_name, 0) + int(row["amount"] or 0)
+            data = await _calculate_fightnight_financial_snapshot(conn, session)
+            if session["status"] == "active":
+                source = "🟢 **LIVE FINANCIAL DATA**"
+            else:
+                source = "📜 **LEGACY SESSION — LIVE RECONSTRUCTION**"
+            opened_by = session["started_by_name"]
+            closed_by = session["ended_by_name"]
 
     gym_lines = [
         f"**{gym}** — {_money(amount)}"
         for gym, amount in sorted(
-            gym_totals.items(),
+            data["gym_totals"].items(),
             key=lambda item: (-item[1], item[0].casefold()),
         )
     ]
 
-    status_text = "🟢 ACTIVE" if is_active else "🔒 CLOSED"
+    status_text = "🟢 ACTIVE" if session["status"] == "active" else "🔒 CLOSED"
     embed = discord.Embed(
         title=f"🧾 OSBL FIGHT NIGHT FINANCIAL CLOSEOUT — SESSION {session['id']}",
         description=(
             f"{status_text}\n"
+            f"{source}\n"
             "Official purse, bank-credit, and payout activity for this Fight Night."
         ),
         color=discord.Color.gold(),
@@ -2252,77 +2332,66 @@ async def fightnightfinance(ctx, session_id: int = None):
     embed.add_field(
         name="🥊 Fight Night Activity",
         value=(
-            f"Official Fights: **{fight_stats['official_fights']}**\n"
-            f"Regular Fights: **{fight_stats['regular_fights']}**\n"
-            f"Championship Fights: **{fight_stats['championship_fights']}**\n"
-            f"Reversed Fights: **{fight_stats['reversed_fights']}**"
+            f"Official Fights: **{data['official_fights']}**\n"
+            f"Regular Fights: **{data['regular_fights']}**\n"
+            f"Championship Fights: **{data['championship_fights']}**\n"
+            f"Reversed Fights: **{data['reversed_fights']}**"
         ),
         inline=True,
     )
-
     embed.add_field(
         name="💰 Purse Credits",
         value=(
-            f"Total Credited: **{_money(total_purses)}**\n"
-            f"Regular Purse Total: **{_money(regular_purses)}**\n"
-            f"Championship Purse Total: **{_money(championship_purses)}**\n"
-            f"Fighters Credited: **{credited_fighters}**"
+            f"Total Credited: **{_money(data['total_purses'])}**\n"
+            f"Regular Purse Total: **{_money(data['regular_purses'])}**\n"
+            f"Championship Purse Total: **{_money(data['championship_purses'])}**\n"
+            f"Fighters Credited: **{data['fighters_credited']}**"
         ),
         inline=True,
     )
-
     embed.add_field(
         name="🏦 Fighter Bank Impact",
         value=(
-            f"Added to Stacked Balances: **{_money(total_purses)}**\n"
-            f"Reversed Purse Entries: **{len(reversed_rows)}**\n"
-            f"Reversed Purse Value: **{_money(reversed_value)}**"
+            f"Added to Stacked Balances: **{_money(data['total_purses'])}**\n"
+            f"Reversed Purse Entries: **{data['reversed_purse_entries']}**\n"
+            f"Reversed Purse Value: **{_money(data['reversed_purse_value'])}**"
         ),
         inline=False,
     )
-
     embed.add_field(
         name="💵 Cashouts During Fight Night",
         value=(
-            f"Completed Cashouts: **{int(cashout_stats['cashout_count'] or 0)}**\n"
-            f"Actually Paid: **{_money(cashout_stats['cashout_total'])}**"
+            f"Completed Cashouts: **{data['cashout_count']}**\n"
+            f"Actually Paid: **{_money(data['cashout_total'])}**"
         ),
         inline=True,
     )
-
     embed.add_field(
         name="⏳ Payout Requests During Fight Night",
         value=(
-            f"Requests Created: **{int(request_stats['requests_created'] or 0)}**\n"
-            f"Still Pending: **{int(request_stats['pending_count'] or 0)}**\n"
-            f"Pending Amount: **{_money(request_stats['pending_total'])}**"
+            f"Requests Created: **{data['requests_created']}**\n"
+            f"Still Pending: **{data['pending_count']}**\n"
+            f"Pending Amount: **{_money(data['pending_total'])}**"
         ),
         inline=True,
     )
-
     embed.add_field(
         name="🏢 Purse Credits by Gym",
         value="\n".join(gym_lines) if gym_lines else "No active purse credits for this session.",
         inline=False,
     )
-
     embed.add_field(
         name="👤 Session Staff",
         value=(
-            f"Opened by: **{session['started_by_name']}**\n"
-            + (
-                f"Closed by: **{session['ended_by_name']}**"
-                if session["ended_by_name"]
-                else "Closed by: **—**"
-            )
+            f"Opened by: **{opened_by}**\n"
+            + (f"Closed by: **{closed_by}**" if closed_by else "Closed by: **—**")
         ),
         inline=False,
     )
-
     embed.set_footer(
         text=(
             f"{FIGHT_NIGHT_FINANCE_VERSION} • "
-            "Purse credits come from the official payout ledger"
+            + ("Frozen archived accounting" if snapshot else "Live/reconstructed accounting")
         )
     )
     await ctx.send(embed=embed)
