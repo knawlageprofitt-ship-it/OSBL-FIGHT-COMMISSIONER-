@@ -1,6 +1,13 @@
 
 import os
 import io
+import json
+import gzip
+import base64
+import shutil
+import hashlib
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 import discord
 import asyncpg
@@ -419,6 +426,7 @@ GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
+DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -558,6 +566,7 @@ async def systemcheck(ctx):
         "confirmdeletetestfighter",
         "deletetestseason",
         "confirmdeletetestseason",
+        "databasebackup",
     ]
 
     missing_commands = []
@@ -646,6 +655,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🧹 Test Cleanup",
         value=f"**{CLEANUP_SYSTEM_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="💾 Database Backup",
+        value=f"**{DATABASE_BACKUP_VERSION}**",
         inline=False,
     )
 
@@ -5228,6 +5242,246 @@ async def undolog(ctx, limit: int = 10):
     )
 
     await ctx.send(embed=embed)
+
+# =========================================================
+# OSBL DATABASE BACKUP SYSTEM
+# Commissioner-only manual backup for mobile/iPhone workflow.
+# Prefers pg_dump when available; otherwise creates a complete
+# compressed logical JSON snapshot of every public table.
+# =========================================================
+
+def _osbl_backup_json_value(value):
+    """Convert PostgreSQL values into JSON-safe values without losing bytes."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return {
+            "__osbl_type__": "bytes_base64",
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    if isinstance(value, datetime):
+        return {
+            "__osbl_type__": "datetime",
+            "data": value.isoformat(),
+        }
+    # Decimal, UUID, date/time, inet and other asyncpg-supported values
+    # are preserved textually if they are not primitive JSON values.
+    return {
+        "__osbl_type__": type(value).__name__,
+        "data": str(value),
+    }
+
+
+async def _create_osbl_json_backup(path):
+    """Create a gzip-compressed logical backup of all public tables."""
+    async with bot.db.acquire() as conn:
+        table_rows = await conn.fetch(
+            """
+            SELECT tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname = 'public'
+            ORDER BY tablename
+            """
+        )
+        table_names = [row["tablename"] for row in table_rows]
+
+        payload = {
+            "backup_format": "OSBL_LOGICAL_JSON_V1",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "database_engine": "PostgreSQL",
+            "system_version": DATABASE_BACKUP_VERSION,
+            "tables": {},
+        }
+
+        for table_name in table_names:
+            column_rows = await conn.fetch(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    udt_name,
+                    is_nullable,
+                    column_default,
+                    ordinal_position
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                ORDER BY ordinal_position
+                """,
+                table_name,
+            )
+
+            # Table names come only from pg_catalog, so quoting them here is safe.
+            quoted_table = '"' + table_name.replace('"', '""') + '"'
+            data_rows = await conn.fetch(f"SELECT * FROM {quoted_table}")
+
+            payload["tables"][table_name] = {
+                "columns": [
+                    {
+                        "name": col["column_name"],
+                        "data_type": col["data_type"],
+                        "udt_name": col["udt_name"],
+                        "nullable": col["is_nullable"],
+                        "default": col["column_default"],
+                        "position": col["ordinal_position"],
+                    }
+                    for col in column_rows
+                ],
+                "row_count": len(data_rows),
+                "rows": [
+                    {
+                        key: _osbl_backup_json_value(value)
+                        for key, value in dict(row).items()
+                    }
+                    for row in data_rows
+                ],
+            }
+
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+
+    return {
+        "format": "Compressed logical JSON",
+        "tables": len(payload["tables"]),
+        "rows": sum(t["row_count"] for t in payload["tables"].values()),
+    }
+
+
+def _create_osbl_pg_dump(path):
+    """Create a native PostgreSQL custom-format dump when pg_dump is installed."""
+    pg_dump = shutil.which("pg_dump")
+    if not pg_dump:
+        return None
+
+    result = subprocess.run(
+        [
+            pg_dump,
+            "--format=custom",
+            "--no-owner",
+            "--no-acl",
+            "--file",
+            str(path),
+            DATABASE_URL,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "pg_dump failed: " + (result.stderr.strip() or "unknown pg_dump error")
+        )
+
+    return {
+        "format": "PostgreSQL custom dump",
+        "tables": None,
+        "rows": None,
+    }
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def databasebackup(ctx):
+    """
+    Create an on-demand OSBL database backup and send it as a Discord attachment.
+    The temporary Railway file is deleted immediately after the send attempt.
+    """
+    status_message = await ctx.send(
+        "💾 **OSBL DATABASE BACKUP STARTED**\n"
+        "Creating a protected snapshot of the live PostgreSQL database..."
+    )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    native_path = Path("/tmp") / f"osbl_database_backup_{stamp}.dump"
+    json_path = Path("/tmp") / f"osbl_database_backup_{stamp}.json.gz"
+    backup_path = None
+
+    try:
+        # Prefer a native pg_dump because it is the strongest restore format.
+        info = None
+        try:
+            info = _create_osbl_pg_dump(native_path)
+            if info:
+                backup_path = native_path
+        except Exception as pg_exc:
+            print(
+                "OSBL pg_dump backup unavailable; falling back to logical JSON: "
+                f"{type(pg_exc).__name__}: {pg_exc}"
+            )
+
+        # Railway Python images do not always contain PostgreSQL client tools.
+        # The fallback still captures every public table and row.
+        if backup_path is None:
+            info = await _create_osbl_json_backup(json_path)
+            backup_path = json_path
+
+        size_bytes = backup_path.stat().st_size
+        digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+
+        # Discord upload limits vary by server/account. Keep a conservative
+        # ceiling and fail clearly rather than silently truncating a backup.
+        if size_bytes > 24 * 1024 * 1024:
+            await status_message.edit(
+                content=(
+                    "⚠️ **BACKUP CREATED BUT TOO LARGE FOR DIRECT DISCORD DELIVERY**\n"
+                    f"File size: **{size_bytes / (1024 * 1024):.2f} MB**\n"
+                    "The database has outgrown the mobile Discord-backup workflow. "
+                    "Use Railway/pg_dump storage for this backup."
+                )
+            )
+            return
+
+        description_lines = [
+            "✅ **OSBL DATABASE BACKUP COMPLETE**",
+            f"Format: **{info['format']}**",
+            f"Size: **{size_bytes / 1024:.1f} KB**",
+        ]
+        if info.get("tables") is not None:
+            description_lines.append(f"Tables captured: **{info['tables']}**")
+        if info.get("rows") is not None:
+            description_lines.append(f"Rows captured: **{info['rows']}**")
+        description_lines.extend(
+            [
+                f"SHA-256: `{digest[:16]}…`",
+                "",
+                "Save the attached file to **Files / iCloud Drive**.",
+                "Do not edit or rename its file extension.",
+                f"`{DATABASE_BACKUP_VERSION}`",
+            ]
+        )
+
+        await ctx.send(
+            "\n".join(description_lines),
+            file=discord.File(str(backup_path), filename=backup_path.name),
+        )
+
+        await status_message.edit(
+            content="✅ **OSBL DATABASE BACKUP SENT** — save the attachment to iCloud/Files."
+        )
+
+    except Exception as exc:
+        print(f"Database backup error: {type(exc).__name__}: {exc}")
+        await status_message.edit(
+            content=(
+                "❌ **OSBL DATABASE BACKUP FAILED**\n"
+                f"`{type(exc).__name__}: {exc}`\n"
+                "No database records were changed."
+            )
+        )
+    finally:
+        for path in (native_path, json_path):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as cleanup_exc:
+                print(
+                    "Temporary backup cleanup warning: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+
+
 # =========================================================
 # COMMAND ERROR HANDLING
 # =========================================================
