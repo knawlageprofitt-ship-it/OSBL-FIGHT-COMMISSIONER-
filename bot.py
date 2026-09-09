@@ -1,5 +1,6 @@
 
 import os
+import re
 import io
 import json
 import gzip
@@ -5874,6 +5875,44 @@ def _parse_discord_user_id(raw_value):
     return None
 
 
+def _resolve_discord_user_id_from_context(ctx, raw_value):
+    """
+    Resolve a Discord account from:
+      - @mention
+      - numeric user ID
+      - the command author's username/display/global name
+      - a cached guild member username/display/global name
+    """
+    value = str(raw_value or "").strip()
+    direct_id = _parse_discord_user_id(value)
+    if direct_id is not None:
+        return direct_id
+
+    wanted = value.casefold()
+
+    # This makes self-link testing from iPhone easy even without Member Intent.
+    author_names = {
+        str(getattr(ctx.author, "name", "") or "").casefold(),
+        str(getattr(ctx.author, "display_name", "") or "").casefold(),
+        str(getattr(ctx.author, "global_name", "") or "").casefold(),
+    }
+    if wanted and wanted in author_names:
+        return int(ctx.author.id)
+
+    guild = getattr(ctx, "guild", None)
+    if guild is not None:
+        for member in getattr(guild, "members", []):
+            member_names = {
+                str(getattr(member, "name", "") or "").casefold(),
+                str(getattr(member, "display_name", "") or "").casefold(),
+                str(getattr(member, "global_name", "") or "").casefold(),
+            }
+            if wanted and wanted in member_names:
+                return int(member.id)
+
+    return None
+
+
 async def _build_payout_receipt_embed(cashout_id):
     cashout = await bot.db.fetchrow(
         """
@@ -5992,11 +6031,12 @@ async def linkfighterdiscord(ctx, *, link_text: str = None):
         await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
         return
 
-    user_id = _parse_discord_user_id(user_text)
+    user_id = _resolve_discord_user_id_from_context(ctx, user_text)
     if user_id is None:
         await ctx.send(
-            "❌ I couldn't read that Discord account.\n"
-            "Use an actual Discord mention, for example: `@PlayerName`."
+            "❌ I couldn't resolve that Discord account.\n"
+            "Use an actual Discord mention, a numeric Discord User ID, "
+            "or the exact username/display name of a member currently visible to the bot."
         )
         return
 
