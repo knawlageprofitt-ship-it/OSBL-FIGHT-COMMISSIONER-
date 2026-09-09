@@ -535,6 +535,7 @@ GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
+FIGHTER_DUPLICATE_VERSION = "V1-FIGHTER-DUPLICATE-CLEANUP-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -700,6 +701,8 @@ async def systemcheck(ctx):
         "treasury",
         "gymtreasury",
         "normalizegyms",
+        "duplicatefightercheck",
+        "mergefighter",
         "treasurytop",
     ]
 
@@ -789,6 +792,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🧹 Gym Normalization",
         value=f"**{GYM_NORMALIZATION_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧬 Fighter Duplicate Cleanup",
+        value=f"**{FIGHTER_DUPLICATE_VERSION}**",
         inline=False,
     )
     embed.add_field(
@@ -6317,6 +6325,249 @@ async def _osbl_treasury_snapshot():
         "pending_count": int(pending_count or 0),
         "cashout_count": int(cashout_count or 0),
     }
+
+
+
+def _fighter_name_signature(value):
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def duplicatefightercheck(ctx):
+    rows = await bot.db.fetch(
+        """
+        SELECT fighter_key, fighter_name, division, gym, wins, losses, rp,
+               career_earnings, champion, title_defenses
+        FROM fighters
+        ORDER BY fighter_name ASC
+        """
+    )
+
+    groups = {}
+    for row in rows:
+        sig = _fighter_name_signature(row["fighter_name"])
+        groups.setdefault(sig, []).append(row)
+
+    duplicates = [members for members in groups.values() if len(members) > 1]
+
+    if not duplicates:
+        await ctx.send(
+            "✅ **OSBL DUPLICATE FIGHTER CHECK**\n"
+            "No exact name-signature duplicates were found.\n"
+            f"`{FIGHTER_DUPLICATE_VERSION}`"
+        )
+        return
+
+    embed = discord.Embed(
+        title="🧬 OSBL POSSIBLE DUPLICATE FIGHTERS",
+        description=(
+            "Read-only scan. Nothing has been changed.\n"
+            "Use `!mergefighter Keep Fighter | Duplicate Fighter` only after verifying the pair."
+        ),
+        color=discord.Color.orange(),
+    )
+
+    for members in duplicates[:10]:
+        lines = []
+        for row in members:
+            crown = " 👑" if row["champion"] else ""
+            lines.append(
+                f"• **{row['fighter_name']}**{crown} — {row['division']} • {row['gym']} • "
+                f"{row['wins']}-{row['losses']} • {row['rp']} RP • {_money(row['career_earnings'])}"
+            )
+        embed.add_field(
+            name=f"Signature: `{_fighter_name_signature(members[0]['fighter_name'])}`",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"{FIGHTER_DUPLICATE_VERSION} • Read-only until !mergefighter is used"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def mergefighter(ctx, *, merge_text: str = None):
+    merge_text = str(merge_text or "").strip()
+    if "|" not in merge_text:
+        await ctx.send(
+            "❌ Use: `!mergefighter Keep Fighter | Duplicate Fighter`\n"
+            "Example: `!mergefighter Guapo Millz | Gaupo Millz`"
+        )
+        return
+
+    keep_name, dup_name = [part.strip() for part in merge_text.split("|", 1)]
+    keep_key = keep_name.casefold()
+    dup_key = dup_name.casefold()
+
+    if keep_key == dup_key:
+        await ctx.send("❌ The keep fighter and duplicate fighter must be different records.")
+        return
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            keep = await conn.fetchrow(
+                "SELECT * FROM fighters WHERE fighter_key = $1 FOR UPDATE",
+                keep_key,
+            )
+            dup = await conn.fetchrow(
+                "SELECT * FROM fighters WHERE fighter_key = $1 FOR UPDATE",
+                dup_key,
+            )
+
+            if not keep:
+                await ctx.send(f"❌ Keep fighter **{keep_name}** was not found.")
+                return
+            if not dup:
+                await ctx.send(f"❌ Duplicate fighter **{dup_name}** was not found.")
+                return
+
+            if keep["champion"] and dup["champion"]:
+                await ctx.send(
+                    "❌ **MERGE BLOCKED** — both records are marked as active champions.\n"
+                    "Resolve championship status first."
+                )
+                return
+
+            if keep["division"] != dup["division"]:
+                await ctx.send(
+                    "❌ **MERGE BLOCKED** — fighters are in different divisions.\n"
+                    f"{keep['fighter_name']}: **{keep['division']}**\n"
+                    f"{dup['fighter_name']}: **{dup['division']}**"
+                )
+                return
+
+            keep_gym = str(keep["gym"] or "").strip()
+            dup_gym = str(dup["gym"] or "").strip()
+            if not keep_gym or "independent" in keep_gym.casefold():
+                merged_gym = dup_gym
+            else:
+                merged_gym = keep_gym
+
+            merged_wins = int(keep["wins"] or 0) + int(dup["wins"] or 0)
+            merged_losses = int(keep["losses"] or 0) + int(dup["losses"] or 0)
+            merged_rp = int(keep["rp"] or 0) + int(dup["rp"] or 0)
+            merged_earnings = int(keep["career_earnings"] or 0) + int(dup["career_earnings"] or 0)
+            merged_defenses = int(keep["title_defenses"] or 0) + int(dup["title_defenses"] or 0)
+            merged_champion = bool(keep["champion"] or dup["champion"])
+            merged_progression = get_progression_rank(merged_rp, merged_champion)
+
+            await conn.execute(
+                "UPDATE fight_history SET winner_key = $1 WHERE winner_key = $2",
+                keep_key, dup_key
+            )
+            await conn.execute(
+                "UPDATE fight_history SET loser_key = $1 WHERE loser_key = $2",
+                keep_key, dup_key
+            )
+
+            await conn.execute(
+                "UPDATE fight_bookings SET fighter1_key = $1 WHERE fighter1_key = $2",
+                keep_key, dup_key
+            )
+            await conn.execute(
+                "UPDATE fight_bookings SET fighter2_key = $1 WHERE fighter2_key = $2",
+                keep_key, dup_key
+            )
+
+            await conn.execute(
+                """
+                UPDATE payout_ledger
+                SET fighter_key = $1,
+                    fighter_name = $2,
+                    gym_name = $3
+                WHERE fighter_key = $4
+                """,
+                keep_key, keep["fighter_name"], merged_gym, dup_key
+            )
+            await conn.execute(
+                """
+                UPDATE payout_requests
+                SET fighter_key = $1,
+                    fighter_name = $2
+                WHERE fighter_key = $3
+                """,
+                keep_key, keep["fighter_name"], dup_key
+            )
+            await conn.execute(
+                """
+                UPDATE payout_cashouts
+                SET fighter_key = $1,
+                    fighter_name = $2
+                WHERE fighter_key = $3
+                """,
+                keep_key, keep["fighter_name"], dup_key
+            )
+
+            keep_link = await conn.fetchrow(
+                "SELECT * FROM fighter_discord_links WHERE fighter_key = $1",
+                keep_key
+            )
+            dup_link = await conn.fetchrow(
+                "SELECT * FROM fighter_discord_links WHERE fighter_key = $1",
+                dup_key
+            )
+            if dup_link and not keep_link:
+                await conn.execute(
+                    """
+                    UPDATE fighter_discord_links
+                    SET fighter_key = $1,
+                        fighter_name = $2,
+                        updated_at = NOW()
+                    WHERE fighter_key = $3
+                    """,
+                    keep_key, keep["fighter_name"], dup_key
+                )
+            elif dup_link and keep_link:
+                await conn.execute(
+                    "DELETE FROM fighter_discord_links WHERE fighter_key = $1",
+                    dup_key
+                )
+
+            await conn.execute(
+                """
+                UPDATE fighters
+                SET gym = $2,
+                    wins = $3,
+                    losses = $4,
+                    rp = $5,
+                    progression_rank = $6,
+                    career_earnings = $7,
+                    champion = $8,
+                    title_defenses = $9,
+                    updated_at = NOW()
+                WHERE fighter_key = $1
+                """,
+                keep_key,
+                merged_gym,
+                merged_wins,
+                merged_losses,
+                merged_rp,
+                merged_progression,
+                merged_earnings,
+                merged_champion,
+                merged_defenses,
+            )
+
+            await conn.execute(
+                "DELETE FROM fighters WHERE fighter_key = $1",
+                dup_key
+            )
+
+    await ctx.send(
+        "✅ **OSBL FIGHTER MERGE COMPLETE**\n"
+        f"Kept: **{keep['fighter_name']}**\n"
+        f"Merged/Removed: **{dup['fighter_name']}**\n"
+        f"Division: **{keep['division']}**\n"
+        f"Gym: **{merged_gym}**\n"
+        f"Combined Record: **{merged_wins}-{merged_losses}**\n"
+        f"Combined RP: **{merged_rp}**\n"
+        f"Combined Career Earnings: **{_money(merged_earnings)}**\n"
+        f"`{FIGHTER_DUPLICATE_VERSION}`"
+    )
 
 
 @bot.command()
