@@ -6330,7 +6330,7 @@ async def normalizegyms(ctx):
 
     snapshots = await _all_gym_snapshots()
     lines = [
-        f"**{g['official_name']}** — {g['fighter_count']} fighter(s)"
+        f"**{g['official_name']}** — {g['roster_size']} fighter(s)"
         for g in snapshots
     ]
 
