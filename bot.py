@@ -399,6 +399,12 @@ class OSBLBot(commands.Bot):
                 default_gyms,
             )
 
+        normalization = await _normalize_existing_gym_data()
+        print(
+            "🧹 OSBL Gym Normalization Ready — "
+            f"{normalization['fighters_updated']} fighter record(s), "
+            f"{normalization['ledger_rows_updated']} payout ledger row(s) normalized"
+        )
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -528,6 +534,7 @@ GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
 GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
+GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -692,6 +699,7 @@ async def systemcheck(ctx):
         "resendreceipt",
         "treasury",
         "gymtreasury",
+        "normalizegyms",
         "treasurytop",
     ]
 
@@ -776,6 +784,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="📚 Gym History",
         value=f"**{GYM_HISTORY_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧹 Gym Normalization",
+        value=f"**{GYM_NORMALIZATION_VERSION}**",
         inline=False,
     )
     embed.add_field(
@@ -2356,6 +2369,12 @@ async def register(ctx, *, details: str = None):
 
     fighter_name, division, gym = parts
 
+    # Store official gyms under one canonical name while still allowing
+    # test gyms / independent promotions that are intentionally non-official.
+    resolved_gym = _resolve_official_gym(gym)
+    if resolved_gym:
+        gym = resolved_gym
+
     divisions = {
         "lightweight": "Lightweight",
         "middleweight": "Middleweight",
@@ -2823,15 +2842,15 @@ async def fighters(ctx, *, division: str = None):
 OFFICIAL_GYMS = {
     "RADEEMERS": {
         "promoter": "Dub Radeem",
-        "aliases": ("radeemers", "radeemers gym", "radeem team", "the radeem team"),
+        "aliases": ("radeemers", "radeemers gym", "radeemer gym", "radeem team", "the radeem team"),
     },
     "ROYAL HITTAZ": {
         "promoter": "Stormi North",
-        "aliases": ("royal hittaz", "royal hittaz gym", "royal hitttaz"),
+        "aliases": ("royal hittaz", "royal hittaz gym", "royal hittaz fight gym", "royal hitttaz"),
     },
     "FINESSE TOWN FIGHTERS": {
         "promoter": "Cheeda Finessa",
-        "aliases": ("finesse town fighters", "finesse town gym", "finesse town"),
+        "aliases": ("finesse town fighters", "finesse town fighters gym", "finesse town gym", "finesse town"),
     },
     "GROVE STREET GOATS": {
         "promoter": "Mr. Souls",
@@ -2854,6 +2873,59 @@ def _resolve_official_gym(value):
         if key in {_norm_gym_text(x) for x in meta["aliases"]}:
             return official
     return None
+
+
+async def _normalize_existing_gym_data():
+    """
+    Canonicalize existing official gym names without touching test gyms,
+    independent fighters, or unrelated promotions.
+    """
+    fighter_rows = await bot.db.fetch(
+        "SELECT fighter_key, fighter_name, gym FROM fighters"
+    )
+
+    fighter_updates = []
+    for row in fighter_rows:
+        official = _resolve_official_gym(row["gym"])
+        current = str(row["gym"] or "").strip()
+        if official and current != official:
+            fighter_updates.append((official, row["fighter_key"]))
+
+    if fighter_updates:
+        await bot.db.executemany(
+            """
+            UPDATE fighters
+            SET gym = $1,
+                updated_at = NOW()
+            WHERE fighter_key = $2
+            """,
+            fighter_updates,
+        )
+
+    ledger_rows = await bot.db.fetch(
+        "SELECT id, gym_name FROM payout_ledger"
+    )
+    ledger_updates = []
+    for row in ledger_rows:
+        official = _resolve_official_gym(row["gym_name"])
+        current = str(row["gym_name"] or "").strip()
+        if official and current != official:
+            ledger_updates.append((official, row["id"]))
+
+    if ledger_updates:
+        await bot.db.executemany(
+            """
+            UPDATE payout_ledger
+            SET gym_name = $1
+            WHERE id = $2
+            """,
+            ledger_updates,
+        )
+
+    return {
+        "fighters_updated": len(fighter_updates),
+        "ledger_rows_updated": len(ledger_updates),
+    }
 
 
 async def _gym_promoter(official_gym):
@@ -6248,6 +6320,48 @@ async def _osbl_treasury_snapshot():
 
 
 @bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def normalizegyms(ctx):
+    """
+    Re-run official gym-name normalization on demand.
+    Safe: it only changes recognized aliases into canonical official names.
+    """
+    result = await _normalize_existing_gym_data()
+
+    snapshots = await _all_gym_snapshots()
+    lines = [
+        f"**{g['official_name']}** — {g['fighter_count']} fighter(s)"
+        for g in snapshots
+    ]
+
+    embed = discord.Embed(
+        title="🧹 OSBL GYM DATA NORMALIZED",
+        description=(
+            f"Fighter records corrected: **{result['fighters_updated']}**\n"
+            f"Payout-ledger rows corrected: **{result['ledger_rows_updated']}**"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="🏢 Canonical Official Gyms",
+        value="\n".join(lines),
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ Canonical Names",
+        value=(
+            "ROYAL HITTAZ\n"
+            "RADEEMERS\n"
+            "FINESSE TOWN FIGHTERS\n"
+            "GROVE STREET GOATS"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=GYM_NORMALIZATION_VERSION)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def treasury(ctx):
     """League-wide OSBL financial dashboard."""
@@ -6375,10 +6489,15 @@ async def treasury(ctx):
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def gymtreasury(ctx, *, gym_name: str = None):
-    """Show the payout exposure for one gym."""
+    """Show the payout exposure for one official gym."""
     gym_name = " ".join(str(gym_name or "").strip().split())
     if not gym_name:
         await ctx.send("❌ Use: `!gymtreasury Gym Name`")
+        return
+
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
         return
 
     rows = await bot.db.fetch(
@@ -6404,14 +6523,14 @@ async def gymtreasury(ctx, *, gym_name: str = None):
         FROM fighters f
         LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
         LEFT JOIN pending p ON p.fighter_key = f.fighter_key
-        WHERE LOWER(TRIM(f.gym)) = LOWER(TRIM($1))
+        WHERE f.gym = $1
         ORDER BY owed DESC, f.career_earnings DESC, f.fighter_name ASC
         """,
-        gym_name,
+        official,
     )
 
     if not rows:
-        await ctx.send(f"❌ No fighters were found for gym **{gym_name}**.")
+        await ctx.send(f"❌ No fighters were found for gym **{official}**.")
         return
 
     earned = sum(int(row["career_earnings"] or 0) for row in rows)
@@ -6420,7 +6539,7 @@ async def gymtreasury(ctx, *, gym_name: str = None):
     pending = sum(int(row["pending"] or 0) for row in rows)
 
     embed = discord.Embed(
-        title=f"🏢 OSBL GYM TREASURY — {gym_name.upper()}",
+        title=f"🏢 OSBL GYM TREASURY — {official}",
         description=f"Financial exposure for **{len(rows)} fighter(s)**.",
         color=discord.Color.gold(),
     )
