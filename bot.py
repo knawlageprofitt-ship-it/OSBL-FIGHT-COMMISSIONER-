@@ -235,6 +235,33 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS gym_season_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    season_name TEXT NOT NULL,
+                    gym_name TEXT NOT NULL,
+                    promoter_name TEXT NOT NULL,
+                    gym_rank INTEGER NOT NULL,
+                    gym_points INTEGER NOT NULL,
+                    wins INTEGER NOT NULL,
+                    losses INTEGER NOT NULL,
+                    total_rp INTEGER NOT NULL,
+                    roster_size INTEGER NOT NULL,
+                    champions INTEGER NOT NULL,
+                    title_defenses INTEGER NOT NULL,
+                    earnings BIGINT NOT NULL,
+                    archived_by_id BIGINT NOT NULL,
+                    archived_by_name TEXT NOT NULL,
+                    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (season_name, gym_name)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS gym_season_history_season_idx
+                ON gym_season_history (season_name, gym_rank);
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -378,6 +405,7 @@ FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
 GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
+GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -400,6 +428,7 @@ async def systemcheck(ctx):
         "fight_bookings",
         "gym_settings",
         "gym_management_log",
+        "gym_season_history",
     ]
 
     try:
@@ -506,6 +535,10 @@ async def systemcheck(ctx):
         "removegym",
         "setpromoter",
         "gymcheck",
+        "archivegymseason",
+        "gymseason",
+        "gymhistory",
+        "gymseasonlist",
     ]
 
     missing_commands = []
@@ -583,6 +616,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🛠️ Gym Management",
         value=f"**{GYM_MANAGEMENT_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📚 Gym History",
+        value=f"**{GYM_HISTORY_VERSION}**",
         inline=False,
     )
 
@@ -3263,6 +3302,206 @@ async def gymroster(ctx, *, gym_name: str = None):
 
     embed.set_footer(text=f"{GYM_SYSTEM_VERSION} • {len(fighters)} fighters")
     await ctx.send(embed=embed)
+
+# =========================================================
+# OSBL GYM HISTORY / SEASON ARCHIVE
+# COMMANDS:
+# !archivegymseason <Season Name>   (Commissioner only)
+# !gymseason <Season Name>
+# !gymhistory <Gym Name>
+# !gymseasonlist
+# =========================================================
+
+
+def _clean_season_name(value):
+    return " ".join(str(value or "").strip().split())
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def archivegymseason(ctx, *, season_name: str = None):
+    season_name = _clean_season_name(season_name)
+    if not season_name:
+        await ctx.send("❌ Use: `!archivegymseason Season Name`")
+        return
+
+    existing = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM gym_season_history WHERE LOWER(season_name) = LOWER($1)",
+        season_name,
+    )
+    if existing:
+        await ctx.send(
+            f"❌ **{season_name}** already has an archived gym snapshot. "
+            "OSBL season archives are locked to preserve history."
+        )
+        return
+
+    snapshots = await _all_gym_snapshots()
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            for g in snapshots:
+                await conn.execute(
+                    """
+                    INSERT INTO gym_season_history (
+                        season_name, gym_name, promoter_name, gym_rank, gym_points,
+                        wins, losses, total_rp, roster_size, champions,
+                        title_defenses, earnings, archived_by_id, archived_by_name
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    """,
+                    season_name,
+                    g["official_name"],
+                    g["promoter"],
+                    int(g["gym_rank"]),
+                    int(g["gym_points"]),
+                    int(g["wins"]),
+                    int(g["losses"]),
+                    int(g["total_rp"]),
+                    int(g["roster_size"]),
+                    len(g["champions"]),
+                    int(g["title_defenses"]),
+                    int(g["earnings"]),
+                    ctx.author.id,
+                    ctx.author.display_name,
+                )
+
+    winner = snapshots[0]
+    embed = discord.Embed(
+        title="🏆 OSBL GYM SEASON ARCHIVED",
+        description=(
+            f"**{season_name}** has been permanently archived.\n"
+            f"🥇 Gym of the Season: **{winner['official_name']}** — **{winner['gym_points']} GP**"
+        ),
+        color=discord.Color.gold(),
+    )
+    for g in snapshots:
+        embed.add_field(
+            name=f"#{g['gym_rank']} {g['official_name']}",
+            value=(
+                f"**{g['gym_points']} GP** • Record **{g['wins']}-{g['losses']}** • "
+                f"**{g['total_rp']} RP** • {g['roster_size']} Fighters"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text=f"{GYM_HISTORY_VERSION} • Archived by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymseason(ctx, *, season_name: str = None):
+    season_name = _clean_season_name(season_name)
+    if not season_name:
+        await ctx.send("❌ Use: `!gymseason Season Name`")
+        return
+
+    rows = await bot.db.fetch(
+        """
+        SELECT *
+        FROM gym_season_history
+        WHERE LOWER(season_name) = LOWER($1)
+        ORDER BY gym_rank ASC, gym_name ASC
+        """,
+        season_name,
+    )
+    if not rows:
+        await ctx.send(f"❌ No archived gym season found for **{season_name}**.")
+        return
+
+    official_season = rows[0]["season_name"]
+    winner = rows[0]
+    embed = discord.Embed(
+        title=f"📚 OSBL GYM SEASON — {official_season}",
+        description=f"🏆 **Gym of the Season: {winner['gym_name']}** — {winner['gym_points']} GP",
+        color=discord.Color.gold(),
+    )
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for row in rows:
+        badge = medals.get(int(row["gym_rank"]), f"#{row['gym_rank']}")
+        embed.add_field(
+            name=f"{badge} {row['gym_name']}",
+            value=(
+                f"Leader / Promoter: **{row['promoter_name']}**\n"
+                f"**{row['gym_points']} GP** • Record **{row['wins']}-{row['losses']}** • "
+                f"**{row['total_rp']} RP**\n"
+                f"👥 {row['roster_size']} • 👑 {row['champions']} • 🛡️ {row['title_defenses']} • "
+                f"💰 ${int(row['earnings']):,}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text=f"{GYM_HISTORY_VERSION} • Historical snapshot — read only")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymhistory(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    rows = await bot.db.fetch(
+        """
+        SELECT *
+        FROM gym_season_history
+        WHERE gym_name = $1
+        ORDER BY archived_at DESC, id DESC
+        LIMIT 10
+        """,
+        official,
+    )
+    if not rows:
+        await ctx.send(f"📚 **{official}** has no archived OSBL gym seasons yet.")
+        return
+
+    wins = sum(1 for row in rows if int(row["gym_rank"]) == 1)
+    embed = discord.Embed(
+        title=f"📚 OSBL GYM HISTORY — {official}",
+        description=f"Archived Seasons: **{len(rows)}** • Gym of the Season Wins: **{wins}**",
+        color=discord.Color.gold(),
+    )
+    for row in rows:
+        crown = " 🏆" if int(row["gym_rank"]) == 1 else ""
+        embed.add_field(
+            name=f"{row['season_name']} — #{row['gym_rank']}{crown}",
+            value=(
+                f"**{row['gym_points']} GP** • {row['wins']}-{row['losses']} • {row['total_rp']} RP • "
+                f"{row['champions']} Champions • {row['title_defenses']} Defenses"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text=f"{GYM_HISTORY_VERSION} • Showing up to 10 archived seasons")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymseasonlist(ctx):
+    rows = await bot.db.fetch(
+        """
+        SELECT season_name, MIN(archived_at) AS archived_at, COUNT(*) AS gym_count
+        FROM gym_season_history
+        GROUP BY season_name
+        ORDER BY MIN(archived_at) DESC
+        LIMIT 20
+        """
+    )
+    if not rows:
+        await ctx.send("📚 No gym seasons have been archived yet.")
+        return
+
+    lines = []
+    for row in rows:
+        dt = row["archived_at"]
+        date_text = dt.strftime("%Y-%m-%d") if dt else "Unknown date"
+        lines.append(f"• **{row['season_name']}** — {row['gym_count']} gyms • {date_text}")
+
+    embed = discord.Embed(
+        title="📚 OSBL GYM SEASON ARCHIVES",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"{GYM_HISTORY_VERSION} • Use !gymseason <Season Name>")
+    await ctx.send(embed=embed)
+
 
 # ============================================================
 # RECORD FIGHT RESULT
