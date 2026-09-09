@@ -337,6 +337,7 @@ POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
+GYM_POSTER_VERSION = "V1-GYM-POSTERS-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -524,6 +525,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🏢 Gym System",
         value=f"**{GYM_SYSTEM_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🖼️ Gym Posters",
+        value=f"**{GYM_POSTER_VERSION}**",
         inline=False,
     )
 
@@ -2706,6 +2713,138 @@ def _gym_usage():
         "**FINESSE TOWN FIGHTERS**\n"
         "**GROVE STREET GOATS**"
     )
+
+
+GYM_POSTER_TEMPLATES = {
+    "ROYAL HITTAZ": "osbl_gym_royal_hittaz.png",
+    "RADEEMERS": "osbl_gym_radeemers.png",
+    "FINESSE TOWN FIGHTERS": "osbl_gym_finesse_town.png",
+    "GROVE STREET GOATS": "osbl_gym_grove_street_goats.png",
+}
+
+
+def _render_gym_poster(snapshot):
+    from PIL import Image, ImageDraw
+
+    official = snapshot["official_name"]
+    filename = GYM_POSTER_TEMPLATES[official]
+    path = Path(__file__).resolve().parent / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Missing gym poster template: {filename}")
+
+    image = Image.open(path).convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
+    w, h = image.size
+
+    # Live-stat strip: intentionally covers the template's baked-in stat row so
+    # the Discord poster always reflects current OSBL database values.
+    top = int(h * 0.735)
+    bottom = int(h * 0.925)
+    margin = int(w * 0.055)
+    draw.rounded_rectangle(
+        (margin, top, w - margin, bottom),
+        radius=max(14, int(h * 0.018)),
+        fill=(5, 5, 5, 235),
+        outline=(212, 170, 55, 255),
+        width=max(2, int(w * 0.0025)),
+    )
+
+    title_font = _fit_font(draw, "LIVE OSBL GYM STATS", w * 0.38, int(h * 0.036), 18)
+    _draw_centered(
+        draw,
+        (margin, top + 4, w - margin, top + int(h * 0.055)),
+        "LIVE OSBL GYM STATS",
+        title_font,
+        fill=(238, 198, 76),
+        stroke=1,
+    )
+
+    stats = [
+        ("GYM RANK", f"#{snapshot['gym_rank']}"),
+        ("GYM POINTS", str(snapshot['gym_points'])),
+        ("RECORD", f"{snapshot['wins']}-{snapshot['losses']}"),
+        ("TOTAL RP", str(snapshot['total_rp'])),
+        ("FIGHTERS", str(snapshot['roster_size'])),
+        ("CHAMPIONS", str(len(snapshot['champions']))),
+        ("DEFENSES", str(snapshot['title_defenses'])),
+        ("EARNINGS", f"${snapshot['earnings']:,}"),
+    ]
+
+    row_top = top + int(h * 0.062)
+    row_bottom = bottom - int(h * 0.032)
+    usable_w = (w - 2 * margin)
+    cell_w = usable_w / len(stats)
+    label_font = _load_osbl_font(max(13, int(h * 0.018)), bold=True)
+    value_font = _load_osbl_font(max(18, int(h * 0.029)), bold=True)
+
+    for i, (label, value) in enumerate(stats):
+        x1 = margin + int(i * cell_w)
+        x2 = margin + int((i + 1) * cell_w)
+        if i:
+            draw.line((x1, row_top, x1, row_bottom), fill=(212, 170, 55, 190), width=2)
+        lf = _fit_font(draw, label, cell_w - 12, int(h * 0.018), 10)
+        vf = _fit_font(draw, value, cell_w - 10, int(h * 0.03), 13)
+        _draw_centered(draw, (x1 + 4, row_top, x2 - 4, row_top + int(h * 0.032)), label, lf, fill=(230, 220, 190), stroke=1)
+        _draw_centered(draw, (x1 + 4, row_top + int(h * 0.031), x2 - 4, row_bottom), value, vf, fill=(255, 255, 255), stroke=2)
+
+    footer_font = _fit_font(draw, GYM_POSTER_VERSION, w * 0.28, int(h * 0.014), 9)
+    draw.text(
+        (margin + 8, bottom - int(h * 0.026)),
+        GYM_POSTER_VERSION,
+        font=footer_font,
+        fill=(220, 205, 160),
+        stroke_width=1,
+        stroke_fill=(0, 0, 0),
+    )
+
+    out = io.BytesIO()
+    image.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return out
+
+
+async def _send_gym_poster(ctx, official):
+    snapshots = await _all_gym_snapshots()
+    g = next(x for x in snapshots if x["official_name"] == official)
+    poster = _render_gym_poster(g)
+    attachment_name = "osbl_" + official.casefold().replace(" ", "_") + "_gym_poster.png"
+    file = discord.File(poster, filename=attachment_name)
+    embed = discord.Embed(
+        title=f"🏢 OSBL OFFICIAL GYM BANNER — {official}",
+        description=(
+            f"**Gym Rank #{g['gym_rank']} • {g['gym_points']} GP**\n"
+            f"Leader / Promoter: **{g['promoter']}** • Record **{g['wins']}-{g['losses']}** • **{g['total_rp']} RP**"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.set_image(url=f"attachment://{attachment_name}")
+    embed.set_footer(text=f"{GYM_POSTER_VERSION} • LIVE OSBL GYM DATA")
+    await ctx.send(embed=embed, file=file)
+
+
+@bot.command()
+async def gymposter(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(
+            _gym_usage()
+            + "\n\nPoster format: `!gymposter Royal HITTAZ`"
+        )
+        return
+    try:
+        await _send_gym_poster(ctx, official)
+    except Exception as exc:
+        await ctx.send(f"❌ Gym poster could not render: `{exc}`")
+
+
+@bot.command()
+async def gymposterall(ctx):
+    await ctx.send("🏢 **OSBL OFFICIAL GYM BANNERS** — refreshing live gym data...")
+    for official in OFFICIAL_GYMS:
+        try:
+            await _send_gym_poster(ctx, official)
+        except Exception as exc:
+            await ctx.send(f"❌ **{official}** poster could not render: `{exc}`")
 
 
 @bot.command()
