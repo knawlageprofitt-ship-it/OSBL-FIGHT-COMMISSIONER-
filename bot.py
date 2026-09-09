@@ -6491,7 +6491,20 @@ async def mergefighter(ctx, *, merge_text: str = None):
             merged_earnings = int(keep["career_earnings"] or 0) + int(dup["career_earnings"] or 0)
             merged_defenses = int(keep["title_defenses"] or 0) + int(dup["title_defenses"] or 0)
             merged_champion = bool(keep["champion"] or dup["champion"])
-            merged_progression = get_progression_rank(merged_rp, merged_champion)
+            if merged_champion:
+                merged_progression = "Champion"
+            elif merged_rp >= 140:
+                merged_progression = "#1 Contender"
+            elif merged_rp >= 110:
+                merged_progression = "Elite Contender"
+            elif merged_rp >= 80:
+                merged_progression = "Top Contender"
+            elif merged_rp >= 50:
+                merged_progression = "Contender"
+            elif merged_rp >= 25:
+                merged_progression = "Rising Prospect"
+            else:
+                merged_progression = "Prospect"
 
             await conn.execute(
                 "UPDATE fight_history SET winner_key = $1 WHERE winner_key = $2",
