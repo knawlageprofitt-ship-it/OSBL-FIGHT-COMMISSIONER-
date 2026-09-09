@@ -1871,8 +1871,6 @@ async def fightnightstatus(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command()
-
 async def _calculate_fightnight_financial_snapshot(conn, session):
     """Calculate one session's financial totals from current live data."""
     is_active = session["status"] == "active"
@@ -2035,6 +2033,7 @@ async def _freeze_fightnight_financial_snapshot(conn, session):
     return data
 
 
+@bot.command()
 @commands.has_any_role("OSBL COMMISSIONER")
 async def endfightnight(ctx):
     async with bot.db.acquire() as conn:
