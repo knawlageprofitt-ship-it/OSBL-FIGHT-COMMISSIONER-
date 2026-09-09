@@ -1,6 +1,7 @@
 
 import os
 import re
+from difflib import SequenceMatcher
 import io
 import json
 import gzip
@@ -535,7 +536,7 @@ GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
-FIGHTER_DUPLICATE_VERSION = "V1-FIGHTER-DUPLICATE-CLEANUP-2026-09-09"
+FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -6335,6 +6336,12 @@ def _fighter_name_signature(value):
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def duplicatefightercheck(ctx):
+    """
+    Read-only fuzzy duplicate scan.
+    Detects:
+      - exact normalized duplicates
+      - likely typos/transpositions such as "Guapo Millz" vs "Gaupo Millz"
+    """
     rows = await bot.db.fetch(
         """
         SELECT fighter_key, fighter_name, division, gym, wins, losses, rp,
@@ -6344,17 +6351,47 @@ async def duplicatefightercheck(ctx):
         """
     )
 
-    groups = {}
-    for row in rows:
-        sig = _fighter_name_signature(row["fighter_name"])
-        groups.setdefault(sig, []).append(row)
+    candidates = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a = rows[i]
+            b = rows[j]
 
-    duplicates = [members for members in groups.values() if len(members) > 1]
+            sig_a = _fighter_name_signature(a["fighter_name"])
+            sig_b = _fighter_name_signature(b["fighter_name"])
+            if not sig_a or not sig_b:
+                continue
 
-    if not duplicates:
+            # Keep the scan conservative:
+            # compare only fighters in the same division and same canonical gym.
+            if str(a["division"]) != str(b["division"]):
+                continue
+
+            gym_a = _resolve_official_gym(a["gym"]) or str(a["gym"] or "").strip()
+            gym_b = _resolve_official_gym(b["gym"]) or str(b["gym"] or "").strip()
+            if gym_a.casefold() != gym_b.casefold():
+                continue
+
+            ratio = SequenceMatcher(None, sig_a, sig_b).ratio()
+
+            # Exact normalized match OR strong fuzzy match.
+            if sig_a == sig_b:
+                confidence = 1.0
+                reason = "EXACT NORMALIZED MATCH"
+            elif ratio >= 0.82:
+                confidence = ratio
+                reason = "LIKELY TYPO / NAME VARIANT"
+            else:
+                continue
+
+            candidates.append((confidence, reason, a, b))
+
+    candidates.sort(key=lambda x: (-x[0], x[2]["fighter_name"].casefold(), x[3]["fighter_name"].casefold()))
+
+    if not candidates:
         await ctx.send(
             "✅ **OSBL DUPLICATE FIGHTER CHECK**\n"
-            "No exact name-signature duplicates were found.\n"
+            "No likely duplicate fighter pairs were found.\n"
             f"`{FIGHTER_DUPLICATE_VERSION}`"
         )
         return
@@ -6362,23 +6399,24 @@ async def duplicatefightercheck(ctx):
     embed = discord.Embed(
         title="🧬 OSBL POSSIBLE DUPLICATE FIGHTERS",
         description=(
-            "Read-only scan. Nothing has been changed.\n"
-            "Use `!mergefighter Keep Fighter | Duplicate Fighter` only after verifying the pair."
+            "Read-only fuzzy scan. **Nothing has been changed.**\n"
+            "Review each pair before using `!mergefighter Keep Fighter | Duplicate Fighter`."
         ),
         color=discord.Color.orange(),
     )
 
-    for members in duplicates[:10]:
-        lines = []
-        for row in members:
-            crown = " 👑" if row["champion"] else ""
-            lines.append(
-                f"• **{row['fighter_name']}**{crown} — {row['division']} • {row['gym']} • "
-                f"{row['wins']}-{row['losses']} • {row['rp']} RP • {_money(row['career_earnings'])}"
-            )
+    for confidence, reason, a, b in candidates[:10]:
+        pct = round(confidence * 100)
+        value = (
+            f"**{a['fighter_name']}** — {a['division']} • {a['gym']} • "
+            f"{a['wins']}-{a['losses']} • {a['rp']} RP • {_money(a['career_earnings'])}\n"
+            f"**{b['fighter_name']}** — {b['division']} • {b['gym']} • "
+            f"{b['wins']}-{b['losses']} • {b['rp']} RP • {_money(b['career_earnings'])}\n"
+            f"Match confidence: **{pct}%**"
+        )
         embed.add_field(
-            name=f"Signature: `{_fighter_name_signature(members[0]['fighter_name'])}`",
-            value="\n".join(lines),
+            name=f"⚠️ {reason}",
+            value=value,
             inline=False,
         )
 
