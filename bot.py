@@ -262,6 +262,18 @@ class OSBLBot(commands.Bot):
                 ON gym_season_history (season_name, gym_rank);
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS test_cleanup_audit_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    cleanup_type TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    details TEXT,
+                    commissioner_id BIGINT NOT NULL,
+                    commissioner_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -406,6 +418,7 @@ GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
 GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
+CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -429,6 +442,7 @@ async def systemcheck(ctx):
         "gym_settings",
         "gym_management_log",
         "gym_season_history",
+        "test_cleanup_audit_log",
     ]
 
     try:
@@ -539,6 +553,11 @@ async def systemcheck(ctx):
         "gymseason",
         "gymhistory",
         "gymseasonlist",
+        "testfighterlist",
+        "deletetestfighter",
+        "confirmdeletetestfighter",
+        "deletetestseason",
+        "confirmdeletetestseason",
     ]
 
     missing_commands = []
@@ -622,6 +641,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="📚 Gym History",
         value=f"**{GYM_HISTORY_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧹 Test Cleanup",
+        value=f"**{CLEANUP_SYSTEM_VERSION}**",
         inline=False,
     )
 
@@ -3501,6 +3525,234 @@ async def gymseasonlist(ctx):
     )
     embed.set_footer(text=f"{GYM_HISTORY_VERSION} • Use !gymseason <Season Name>")
     await ctx.send(embed=embed)
+
+
+
+# =========================================================
+# OSBL TEST CLEANUP SYSTEM
+# Commissioner-only destructive cleanup with confirmation.
+# Commands:
+# !testfighterlist
+# !deletetestfighter <Fighter Name>
+# !confirmdeletetestfighter <Fighter Name>
+# !deletetestseason <Season Name>
+# !confirmdeletetestseason <Season Name>
+# =========================================================
+
+_PENDING_TEST_FIGHTER_DELETES = {}
+_PENDING_TEST_SEASON_DELETES = {}
+
+
+def _is_test_label(value):
+    text = " ".join(str(value or "").casefold().replace("_", " ").split())
+    return (
+        "test" in text
+        or "stand-in" in text
+        or "stand in" in text
+        or text.startswith("dummy ")
+        or text == "dummy"
+    )
+
+
+@bot.command()
+async def testfighterlist(ctx):
+    rows = await bot.db.fetch(
+        """
+        SELECT fighter_name, division, gym, wins, losses, rp, champion
+        FROM fighters
+        ORDER BY fighter_name ASC
+        """
+    )
+    rows = [row for row in rows if _is_test_label(row["fighter_name"])]
+    if not rows:
+        await ctx.send("🧹 No obvious test fighters are currently stored.")
+        return
+
+    lines = []
+    for row in rows:
+        champ = " 👑" if row["champion"] else ""
+        lines.append(
+            f"• **{row['fighter_name']}**{champ} — {row['division']} • "
+            f"{row['wins']}-{row['losses']} • {row['rp']} RP • {row['gym']}"
+        )
+    embed = discord.Embed(
+        title="🧪 OSBL TEST FIGHTERS",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text=f"{CLEANUP_SYSTEM_VERSION} • Read only")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def deletetestfighter(ctx, *, fighter_name: str = None):
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!deletetestfighter Fighter Name`")
+        return
+
+    key = fighter_name.casefold()
+    row = await bot.db.fetchrow(
+        "SELECT fighter_key, fighter_name, division, gym, wins, losses, rp FROM fighters WHERE fighter_key = $1",
+        key,
+    )
+    if not row:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+    if not _is_test_label(row["fighter_name"]):
+        await ctx.send(
+            "🛑 **DELETE BLOCKED** — this command only deletes fighters whose names clearly identify them as test/stand-in data."
+        )
+        return
+
+    history_count = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM fight_history WHERE winner_key = $1 OR loser_key = $1", key
+    )
+    booking_count = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM fight_bookings WHERE fighter1_key = $1 OR fighter2_key = $1", key
+    )
+    _PENDING_TEST_FIGHTER_DELETES[ctx.author.id] = key
+
+    embed = discord.Embed(
+        title="⚠️ CONFIRM TEST FIGHTER DELETE",
+        description=(
+            f"You are about to permanently remove **{row['fighter_name']}** and linked test data.\n\n"
+            f"Division: **{row['division']}**\nGym: **{row['gym']}**\n"
+            f"Record: **{row['wins']}-{row['losses']}** • **{row['rp']} RP**\n"
+            f"Fight-history rows: **{history_count}**\nBookings: **{booking_count}**\n\n"
+            f"Confirm with:\n`!confirmdeletetestfighter {row['fighter_name']}`"
+        ),
+        color=discord.Color.red(),
+    )
+    embed.set_footer(text=f"{CLEANUP_SYSTEM_VERSION} • Commissioner only")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def confirmdeletetestfighter(ctx, *, fighter_name: str = None):
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    key = fighter_name.casefold()
+    pending = _PENDING_TEST_FIGHTER_DELETES.get(ctx.author.id)
+    if not pending or pending != key:
+        await ctx.send("❌ No matching pending test-fighter deletion. Run `!deletetestfighter <name>` first.")
+        return
+
+    row = await bot.db.fetchrow("SELECT * FROM fighters WHERE fighter_key = $1", key)
+    if not row or not _is_test_label(row["fighter_name"]):
+        _PENDING_TEST_FIGHTER_DELETES.pop(ctx.author.id, None)
+        await ctx.send("❌ Test fighter no longer exists or no longer qualifies for protected test cleanup.")
+        return
+
+    division = row["division"]
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            history_ids = await conn.fetch(
+                "SELECT id FROM fight_history WHERE winner_key = $1 OR loser_key = $1", key
+            )
+            ids = [int(r["id"]) for r in history_ids]
+            deleted_history = len(ids)
+            if ids:
+                await conn.execute("DELETE FROM undo_audit_log WHERE fight_history_id = ANY($1::bigint[])", ids)
+                await conn.execute("DELETE FROM result_override_log WHERE duplicate_history_id = ANY($1::bigint[])", ids)
+            await conn.execute("DELETE FROM undo_audit_log WHERE winner_key = $1 OR loser_key = $1", key)
+            await conn.execute("DELETE FROM result_override_log WHERE winner_key = $1 OR loser_key = $1", key)
+            bookings_status = await conn.execute(
+                "DELETE FROM fight_bookings WHERE fighter1_key = $1 OR fighter2_key = $1", key
+            )
+            await conn.execute("DELETE FROM fight_history WHERE winner_key = $1 OR loser_key = $1", key)
+            await conn.execute("DELETE FROM gym_management_log WHERE fighter_key = $1", key)
+            await conn.execute("DELETE FROM fighters WHERE fighter_key = $1", key)
+            await conn.execute(
+                """
+                INSERT INTO test_cleanup_audit_log
+                    (cleanup_type, target_name, details, commissioner_id, commissioner_name)
+                VALUES ('fighter', $1, $2, $3, $4)
+                """,
+                row["fighter_name"],
+                f"Deleted fighter and {deleted_history} linked fight-history rows; bookings cleanup={bookings_status}",
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+    _PENDING_TEST_FIGHTER_DELETES.pop(ctx.author.id, None)
+    await update_division_rankings(division)
+    await ctx.send(
+        f"✅ **TEST FIGHTER CLEANED UP**\n**{row['fighter_name']}** and its linked test records have been permanently removed.\n"
+        f"`{CLEANUP_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def deletetestseason(ctx, *, season_name: str = None):
+    season_name = _clean_season_name(season_name)
+    if not season_name:
+        await ctx.send("❌ Use: `!deletetestseason Season Name`")
+        return
+    if not _is_test_label(season_name):
+        await ctx.send("🛑 **DELETE BLOCKED** — only season names clearly marked as TEST can be removed with this cleanup command.")
+        return
+
+    count = await bot.db.fetchval(
+        "SELECT COUNT(*) FROM gym_season_history WHERE LOWER(season_name) = LOWER($1)", season_name
+    )
+    if not count:
+        await ctx.send(f"❌ No archived gym season found for **{season_name}**.")
+        return
+
+    _PENDING_TEST_SEASON_DELETES[ctx.author.id] = season_name.casefold()
+    await ctx.send(
+        f"⚠️ **CONFIRM TEST SEASON DELETE**\nThis will permanently remove **{season_name}** ({count} gym snapshots).\n"
+        f"Confirm with: `!confirmdeletetestseason {season_name}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def confirmdeletetestseason(ctx, *, season_name: str = None):
+    season_name = _clean_season_name(season_name)
+    pending = _PENDING_TEST_SEASON_DELETES.get(ctx.author.id)
+    if not pending or pending != season_name.casefold():
+        await ctx.send("❌ No matching pending test-season deletion. Run `!deletetestseason <season>` first.")
+        return
+    if not _is_test_label(season_name):
+        _PENDING_TEST_SEASON_DELETES.pop(ctx.author.id, None)
+        await ctx.send("🛑 Delete blocked: only TEST season archives can be removed by this command.")
+        return
+
+    rows = await bot.db.fetch(
+        "SELECT season_name FROM gym_season_history WHERE LOWER(season_name) = LOWER($1) LIMIT 1", season_name
+    )
+    if not rows:
+        _PENDING_TEST_SEASON_DELETES.pop(ctx.author.id, None)
+        await ctx.send(f"❌ No archived gym season found for **{season_name}**.")
+        return
+    official_name = rows[0]["season_name"]
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            result = await conn.execute(
+                "DELETE FROM gym_season_history WHERE LOWER(season_name) = LOWER($1)", season_name
+            )
+            await conn.execute(
+                """
+                INSERT INTO test_cleanup_audit_log
+                    (cleanup_type, target_name, details, commissioner_id, commissioner_name)
+                VALUES ('gym_season', $1, $2, $3, $4)
+                """,
+                official_name,
+                f"Deleted test gym-season archive; database result={result}",
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+    _PENDING_TEST_SEASON_DELETES.pop(ctx.author.id, None)
+    await ctx.send(
+        f"✅ **TEST SEASON CLEANED UP**\nArchived gym season **{official_name}** has been permanently removed.\n"
+        f"`{CLEANUP_SYSTEM_VERSION}`"
+    )
 
 
 # ============================================================
