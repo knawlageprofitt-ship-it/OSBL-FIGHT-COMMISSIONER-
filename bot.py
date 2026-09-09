@@ -211,6 +211,45 @@ class OSBLBot(commands.Bot):
                 ON fight_history (fight_night_session_id);
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS gym_settings (
+                    official_name TEXT PRIMARY KEY,
+                    promoter_name TEXT NOT NULL,
+                    updated_by_id BIGINT,
+                    updated_by_name TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS gym_management_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    fighter_key TEXT,
+                    fighter_name TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    staff_id BIGINT NOT NULL,
+                    staff_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            default_gyms = [
+                ("RADEEMERS", "Dub Radeem"),
+                ("ROYAL HITTAZ", "Stormi North"),
+                ("FINESSE TOWN FIGHTERS", "Cheeda Finessa"),
+                ("GROVE STREET GOATS", "Mr. Souls"),
+            ]
+            await conn.executemany(
+                """
+                INSERT INTO gym_settings (official_name, promoter_name)
+                VALUES ($1, $2)
+                ON CONFLICT (official_name) DO NOTHING
+                """,
+                default_gyms,
+            )
+
         print("✅ OSBL Fighter Database Ready")
 
     async def close(self):
@@ -338,6 +377,7 @@ RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
 GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
+GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -358,6 +398,8 @@ async def systemcheck(ctx):
         "result_override_log",
         "fight_night_sessions",
         "fight_bookings",
+        "gym_settings",
+        "gym_management_log",
     ]
 
     try:
@@ -460,6 +502,10 @@ async def systemcheck(ctx):
         "top10",
         "fighter",
         "fightercard",
+        "setgym",
+        "removegym",
+        "setpromoter",
+        "gymcheck",
     ]
 
     missing_commands = []
@@ -531,6 +577,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🖼️ Gym Posters",
         value=f"**{GYM_POSTER_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛠️ Gym Management",
+        value=f"**{GYM_MANAGEMENT_VERSION}**",
         inline=False,
     )
 
@@ -2596,6 +2648,19 @@ def _resolve_official_gym(value):
     return None
 
 
+async def _gym_promoter(official_gym):
+    try:
+        promoter = await bot.db.fetchval(
+            "SELECT promoter_name FROM gym_settings WHERE official_name = $1",
+            official_gym,
+        )
+        if promoter:
+            return promoter
+    except Exception:
+        pass
+    return OFFICIAL_GYMS[official_gym]["promoter"]
+
+
 def _fighter_belongs_to_gym(raw_gym, official_gym):
     raw = _norm_gym_text(raw_gym)
     if not raw:
@@ -2667,7 +2732,7 @@ async def _gym_snapshot(official_gym):
 
     return {
         "official_name": official_gym,
-        "promoter": OFFICIAL_GYMS[official_gym]["promoter"],
+        "promoter": await _gym_promoter(official_gym),
         "fighters": fighters,
         "roster_size": len(fighters),
         "wins": wins,
@@ -2822,6 +2887,216 @@ async def _send_gym_poster(ctx, official):
     await ctx.send(embed=embed, file=file)
 
 
+# =========================================================
+# OSBL GYM MANAGEMENT
+# WRITE COMMANDS ARE STAFF-ONLY
+# =========================================================
+
+
+def _fighter_key_from_name(name):
+    return str(name or "").casefold().strip()
+
+
+async def _log_gym_management(ctx, action, fighter_row=None, old_value=None, new_value=None):
+    await bot.db.execute(
+        """
+        INSERT INTO gym_management_log (
+            action, fighter_key, fighter_name, old_value, new_value,
+            staff_id, staff_name
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        action,
+        fighter_row["fighter_key"] if fighter_row else None,
+        fighter_row["fighter_name"] if fighter_row else None,
+        old_value,
+        new_value,
+        ctx.author.id,
+        ctx.author.display_name,
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def setgym(ctx, *, details: str = None):
+    if not details or "|" not in details:
+        await ctx.send(
+            "❌ **GYM ASSIGNMENT FORMAT**\n"
+            "`!setgym Fighter Name | Gym Name`\n"
+            "Example: `!setgym Hello Kitty | Royal HITTAZ`"
+        )
+        return
+
+    fighter_name, gym_name = [part.strip() for part in details.split("|", 1)]
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    fighter_key = _fighter_key_from_name(fighter_name)
+    row = await bot.db.fetchrow(
+        "SELECT * FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not row:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+
+    old_gym = str(row["gym"] or "").strip() or "Independent / No Gym Assigned"
+    if _fighter_belongs_to_gym(row["gym"], official):
+        await ctx.send(f"ℹ️ **{row['fighter_name']}** is already assigned to **{official}**.")
+        return
+
+    await bot.db.execute(
+        "UPDATE fighters SET gym = $1, updated_at = NOW() WHERE fighter_key = $2",
+        official,
+        fighter_key,
+    )
+    await _log_gym_management(ctx, "SET_GYM", row, old_gym, official)
+
+    embed = discord.Embed(
+        title="✅ OSBL GYM ASSIGNMENT UPDATED",
+        description=f"**{row['fighter_name']}** is now assigned to **{official}**.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Previous Gym", value=old_gym, inline=True)
+    embed.add_field(name="New Gym", value=official, inline=True)
+    embed.add_field(name="Leader / Promoter", value=await _gym_promoter(official), inline=False)
+    embed.set_footer(text=f"{GYM_MANAGEMENT_VERSION} • Updated by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def removegym(ctx, *, fighter_name: str = None):
+    if not fighter_name:
+        await ctx.send("❌ Use: `!removegym Fighter Name`")
+        return
+
+    fighter_key = _fighter_key_from_name(fighter_name)
+    row = await bot.db.fetchrow(
+        "SELECT * FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not row:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+
+    old_gym = str(row["gym"] or "").strip()
+    if not old_gym:
+        await ctx.send(f"ℹ️ **{row['fighter_name']}** already has no gym assigned.")
+        return
+
+    await bot.db.execute(
+        "UPDATE fighters SET gym = '', updated_at = NOW() WHERE fighter_key = $1",
+        fighter_key,
+    )
+    await _log_gym_management(ctx, "REMOVE_GYM", row, old_gym, "Independent / No Gym Assigned")
+
+    embed = discord.Embed(
+        title="✅ OSBL GYM ASSIGNMENT REMOVED",
+        description=f"**{row['fighter_name']}** is now **Independent / No Gym Assigned**.",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Previous Gym", value=old_gym, inline=False)
+    embed.set_footer(text=f"{GYM_MANAGEMENT_VERSION} • Updated by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def setpromoter(ctx, *, details: str = None):
+    if not details or "|" not in details:
+        await ctx.send(
+            "❌ **PROMOTER UPDATE FORMAT**\n"
+            "`!setpromoter Gym Name | Promoter Name`\n"
+            "Example: `!setpromoter Royal HITTAZ | Stormi North`"
+        )
+        return
+
+    gym_name, promoter_name = [part.strip() for part in details.split("|", 1)]
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    if not promoter_name:
+        await ctx.send("❌ Promoter name cannot be blank.")
+        return
+
+    old_promoter = await _gym_promoter(official)
+    await bot.db.execute(
+        """
+        INSERT INTO gym_settings (
+            official_name, promoter_name, updated_by_id, updated_by_name, updated_at
+        )
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (official_name)
+        DO UPDATE SET
+            promoter_name = EXCLUDED.promoter_name,
+            updated_by_id = EXCLUDED.updated_by_id,
+            updated_by_name = EXCLUDED.updated_by_name,
+            updated_at = NOW()
+        """,
+        official,
+        promoter_name,
+        ctx.author.id,
+        ctx.author.display_name,
+    )
+    await _log_gym_management(ctx, "SET_PROMOTER", None, f"{official}: {old_promoter}", f"{official}: {promoter_name}")
+
+    embed = discord.Embed(
+        title="🎙️ OSBL GYM PROMOTER UPDATED",
+        description=f"**{official}** now lists **{promoter_name}** as Leader / Promoter.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Previous", value=old_promoter, inline=True)
+    embed.add_field(name="Current", value=promoter_name, inline=True)
+    embed.set_footer(text=f"{GYM_MANAGEMENT_VERSION} • Updated by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymcheck(ctx, *, fighter_name: str = None):
+    if not fighter_name:
+        await ctx.send("❌ Use: `!gymcheck Fighter Name`")
+        return
+
+    fighter_key = _fighter_key_from_name(fighter_name)
+    row = await bot.db.fetchrow(
+        "SELECT * FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not row:
+        await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+
+    official = _resolve_official_gym(row["gym"])
+    if official:
+        promoter = await _gym_promoter(official)
+        snapshots = await _all_gym_snapshots()
+        g = next(x for x in snapshots if x["official_name"] == official)
+        description = (
+            f"**{row['fighter_name']}** is assigned to **{official}**.\n"
+            f"Leader / Promoter: **{promoter}**\n"
+            f"Current Gym Rank: **#{g['gym_rank']}** • **{g['gym_points']} GP**"
+        )
+    else:
+        description = (
+            f"**{row['fighter_name']}** is currently **Independent / No Gym Assigned**."
+        )
+
+    embed = discord.Embed(
+        title="🏢 OSBL FIGHTER GYM CHECK",
+        description=description,
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Division", value=row["division"], inline=True)
+    embed.add_field(name="Record", value=f"{row['wins']}-{row['losses']}", inline=True)
+    embed.add_field(name="RP", value=f"{row['rp']} RP", inline=True)
+    embed.set_footer(text=GYM_MANAGEMENT_VERSION)
+    await ctx.send(embed=embed)
+
+
 @bot.command()
 async def gymposter(ctx, *, gym_name: str = None):
     official = _resolve_official_gym(gym_name)
@@ -2959,9 +3234,10 @@ async def gymroster(ctx, *, gym_name: str = None):
         return
 
     fighters = await _gym_fighters(official)
+    promoter = await _gym_promoter(official)
     embed = discord.Embed(
         title=f"🥊 {official} — OFFICIAL GYM ROSTER",
-        description=f"Leader / Promoter: **{OFFICIAL_GYMS[official]['promoter']}**",
+        description=f"Leader / Promoter: **{promoter}**",
         color=discord.Color.gold(),
     )
 
