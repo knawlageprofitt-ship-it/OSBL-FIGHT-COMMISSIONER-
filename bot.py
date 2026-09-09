@@ -537,6 +537,7 @@ GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
 FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
+FIGHT_NIGHT_FINANCE_VERSION = "V1-FIGHT-NIGHT-FINANCE-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -653,6 +654,7 @@ async def systemcheck(ctx):
         "startfightnight",
         "fightnightstatus",
         "fightnightrecap",
+        "fightnightfinance",
         "fightnightlist",
         "endfightnight",
         "matchupcheck",
@@ -813,6 +815,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="💰 Payout System",
         value=f"**{PAYOUT_SYSTEM_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧾 Fight Night Finance",
+        value=f"**{FIGHT_NIGHT_FINANCE_VERSION}**",
         inline=False,
     )
 
@@ -2044,6 +2051,280 @@ async def fightnightlist(ctx):
         embed.add_field(name=field_name, value=chunk, inline=False)
 
     embed.set_footer(text="Use !fightnightrecap <Session ID> for the full archived card")
+    await ctx.send(embed=embed)
+
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightnightfinance(ctx, session_id: int = None):
+    """
+    Official financial closeout for one Fight Night session.
+
+    Usage:
+      !fightnightfinance
+      !fightnightfinance <Session ID>
+    """
+    async with bot.db.acquire() as conn:
+        if session_id is None:
+            session = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_night_sessions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+        else:
+            session = await conn.fetchrow(
+                """
+                SELECT *
+                FROM fight_night_sessions
+                WHERE id = $1
+                """,
+                session_id,
+            )
+
+        if not session:
+            await ctx.send(
+                "❌ **FIGHT NIGHT SESSION NOT FOUND**\n"
+                "Use `!fightnightfinance <Session ID>`."
+            )
+            return
+
+        # Financial window is session start through close time.
+        # For an active session, use NOW().
+        window_end = session["ended_at"]
+        is_active = session["status"] == "active"
+
+        # Fight-night purse ledger. Prefer direct session links; retain
+        # compatibility with older results using the session's history range.
+        ledger_rows = await conn.fetch(
+            """
+            SELECT
+                pl.id,
+                pl.fight_history_id,
+                pl.fighter_key,
+                pl.fighter_name,
+                pl.gym_name,
+                pl.division,
+                pl.fight_type,
+                pl.payout_role,
+                pl.amount,
+                pl.status,
+                pl.created_at
+            FROM payout_ledger pl
+            LEFT JOIN fight_history fh ON fh.id = pl.fight_history_id
+            WHERE
+                pl.fight_night_session_id = $1
+                OR (
+                    pl.fight_night_session_id IS NULL
+                    AND pl.fight_history_id > $2
+                    AND ($3::BIGINT IS NULL OR pl.fight_history_id <= $3)
+                )
+            ORDER BY pl.id ASC
+            """,
+            session["id"],
+            session["start_history_id"],
+            session["end_history_id"],
+        )
+
+        # Count official fights and reversed fights in the session.
+        fight_stats = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE undone = FALSE) AS official_fights,
+                COUNT(*) FILTER (
+                    WHERE undone = FALSE AND fight_type = 'regular'
+                ) AS regular_fights,
+                COUNT(*) FILTER (
+                    WHERE undone = FALSE AND fight_type = 'championship'
+                ) AS championship_fights,
+                COUNT(*) FILTER (WHERE undone = TRUE) AS reversed_fights
+            FROM fight_history
+            WHERE
+                fight_night_session_id = $1
+                OR (
+                    fight_night_session_id IS NULL
+                    AND id > $2
+                    AND ($3::BIGINT IS NULL OR id <= $3)
+                )
+            """,
+            session["id"],
+            session["start_history_id"],
+            session["end_history_id"],
+        )
+
+        # Cashouts completed during the actual Fight Night clock window.
+        if is_active:
+            cashout_stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS cashout_count,
+                    COALESCE(SUM(amount), 0) AS cashout_total
+                FROM payout_cashouts
+                WHERE created_at >= $1
+                  AND created_at <= NOW()
+                """,
+                session["started_at"],
+            )
+            request_stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                    COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total,
+                    COUNT(*) AS requests_created
+                FROM payout_requests
+                WHERE created_at >= $1
+                  AND created_at <= NOW()
+                """,
+                session["started_at"],
+            )
+        else:
+            cashout_stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS cashout_count,
+                    COALESCE(SUM(amount), 0) AS cashout_total
+                FROM payout_cashouts
+                WHERE created_at >= $1
+                  AND created_at <= $2
+                """,
+                session["started_at"],
+                window_end,
+            )
+            request_stats = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                    COALESCE(SUM(requested_amount) FILTER (WHERE status = 'pending'), 0) AS pending_total,
+                    COUNT(*) AS requests_created
+                FROM payout_requests
+                WHERE created_at >= $1
+                  AND created_at <= $2
+                """,
+                session["started_at"],
+                window_end,
+            )
+
+    active_rows = [row for row in ledger_rows if row["status"] == "active"]
+    reversed_rows = [row for row in ledger_rows if row["status"] == "reversed"]
+
+    total_purses = sum(int(row["amount"] or 0) for row in active_rows)
+    regular_purses = sum(
+        int(row["amount"] or 0)
+        for row in active_rows
+        if str(row["fight_type"]).casefold() == "regular"
+    )
+    championship_purses = sum(
+        int(row["amount"] or 0)
+        for row in active_rows
+        if str(row["fight_type"]).casefold() == "championship"
+    )
+    reversed_value = sum(int(row["amount"] or 0) for row in reversed_rows)
+    credited_fighters = len({row["fighter_key"] for row in active_rows})
+
+    gym_totals = {}
+    for row in active_rows:
+        gym_name = _resolve_official_gym(row["gym_name"]) or str(row["gym_name"] or "").strip()
+        if not gym_name:
+            gym_name = "Independent / No Gym Assigned"
+        gym_totals[gym_name] = gym_totals.get(gym_name, 0) + int(row["amount"] or 0)
+
+    gym_lines = [
+        f"**{gym}** — {_money(amount)}"
+        for gym, amount in sorted(
+            gym_totals.items(),
+            key=lambda item: (-item[1], item[0].casefold()),
+        )
+    ]
+
+    status_text = "🟢 ACTIVE" if is_active else "🔒 CLOSED"
+    embed = discord.Embed(
+        title=f"🧾 OSBL FIGHT NIGHT FINANCIAL CLOSEOUT — SESSION {session['id']}",
+        description=(
+            f"{status_text}\n"
+            "Official purse, bank-credit, and payout activity for this Fight Night."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="🥊 Fight Night Activity",
+        value=(
+            f"Official Fights: **{fight_stats['official_fights']}**\n"
+            f"Regular Fights: **{fight_stats['regular_fights']}**\n"
+            f"Championship Fights: **{fight_stats['championship_fights']}**\n"
+            f"Reversed Fights: **{fight_stats['reversed_fights']}**"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="💰 Purse Credits",
+        value=(
+            f"Total Credited: **{_money(total_purses)}**\n"
+            f"Regular Purse Total: **{_money(regular_purses)}**\n"
+            f"Championship Purse Total: **{_money(championship_purses)}**\n"
+            f"Fighters Credited: **{credited_fighters}**"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🏦 Fighter Bank Impact",
+        value=(
+            f"Added to Stacked Balances: **{_money(total_purses)}**\n"
+            f"Reversed Purse Entries: **{len(reversed_rows)}**\n"
+            f"Reversed Purse Value: **{_money(reversed_value)}**"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="💵 Cashouts During Fight Night",
+        value=(
+            f"Completed Cashouts: **{int(cashout_stats['cashout_count'] or 0)}**\n"
+            f"Actually Paid: **{_money(cashout_stats['cashout_total'])}**"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="⏳ Payout Requests During Fight Night",
+        value=(
+            f"Requests Created: **{int(request_stats['requests_created'] or 0)}**\n"
+            f"Still Pending: **{int(request_stats['pending_count'] or 0)}**\n"
+            f"Pending Amount: **{_money(request_stats['pending_total'])}**"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🏢 Purse Credits by Gym",
+        value="\n".join(gym_lines) if gym_lines else "No active purse credits for this session.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="👤 Session Staff",
+        value=(
+            f"Opened by: **{session['started_by_name']}**\n"
+            + (
+                f"Closed by: **{session['ended_by_name']}**"
+                if session["ended_by_name"]
+                else "Closed by: **—**"
+            )
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=(
+            f"{FIGHT_NIGHT_FINANCE_VERSION} • "
+            "Purse credits come from the official payout ledger"
+        )
+    )
     await ctx.send(embed=embed)
 
 
