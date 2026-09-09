@@ -530,7 +530,7 @@ GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
-PAYOUT_SYSTEM_VERSION = "V4-PLAYER-RECEIPTS-2026-09-08"
+PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -690,6 +690,9 @@ async def systemcheck(ctx):
         "fighterdiscord",
         "unlinkfighterdiscord",
         "resendreceipt",
+        "treasury",
+        "gymtreasury",
+        "treasurytop",
     ]
 
     missing_commands = []
@@ -6186,6 +6189,315 @@ async def resendreceipt(ctx, cashout_id: int = None):
         )
     else:
         await ctx.send(f"❌ Cashout **#{cashout_id}** could not be found or rebuilt.")
+
+
+
+async def _osbl_treasury_snapshot():
+    """Return league-wide fighter money totals based on live fighter earnings and cashout tables."""
+    totals = await bot.db.fetchrow(
+        """
+        WITH cashouts AS (
+            SELECT fighter_key, COALESCE(SUM(amount), 0) AS paid_total
+            FROM payout_cashouts
+            GROUP BY fighter_key
+        ),
+        pending AS (
+            SELECT fighter_key, COALESCE(SUM(requested_amount), 0) AS pending_total
+            FROM payout_requests
+            WHERE status = 'pending'
+            GROUP BY fighter_key
+        )
+        SELECT
+            COUNT(*) AS fighter_count,
+            COALESCE(SUM(f.career_earnings), 0) AS career_earnings,
+            COALESCE(SUM(COALESCE(c.paid_total, 0)), 0) AS paid_out,
+            COALESCE(SUM(
+                GREATEST(f.career_earnings - COALESCE(c.paid_total, 0), 0)
+            ), 0) AS stacked_balance,
+            COALESCE(SUM(COALESCE(p.pending_total, 0)), 0) AS pending_total
+        FROM fighters f
+        LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
+        LEFT JOIN pending p ON p.fighter_key = f.fighter_key
+        """
+    )
+
+    pending_count = await bot.db.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM payout_requests
+        WHERE status = 'pending'
+        """
+    )
+
+    cashout_count = await bot.db.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM payout_cashouts
+        """
+    )
+
+    return {
+        "fighter_count": int(totals["fighter_count"] or 0),
+        "career_earnings": int(totals["career_earnings"] or 0),
+        "paid_out": int(totals["paid_out"] or 0),
+        "stacked_balance": int(totals["stacked_balance"] or 0),
+        "pending_total": int(totals["pending_total"] or 0),
+        "pending_count": int(pending_count or 0),
+        "cashout_count": int(cashout_count or 0),
+    }
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def treasury(ctx):
+    """League-wide OSBL financial dashboard."""
+    snap = await _osbl_treasury_snapshot()
+
+    gym_rows = await bot.db.fetch(
+        """
+        WITH cashouts AS (
+            SELECT fighter_key, COALESCE(SUM(amount), 0) AS paid_total
+            FROM payout_cashouts
+            GROUP BY fighter_key
+        ),
+        pending AS (
+            SELECT fighter_key, COALESCE(SUM(requested_amount), 0) AS pending_total
+            FROM payout_requests
+            WHERE status = 'pending'
+            GROUP BY fighter_key
+        )
+        SELECT
+            COALESCE(NULLIF(TRIM(f.gym), ''), 'Independent / No Gym Assigned') AS gym_name,
+            COUNT(*) AS fighters,
+            COALESCE(SUM(f.career_earnings), 0) AS earned,
+            COALESCE(SUM(COALESCE(c.paid_total, 0)), 0) AS paid,
+            COALESCE(SUM(
+                GREATEST(f.career_earnings - COALESCE(c.paid_total, 0), 0)
+            ), 0) AS owed,
+            COALESCE(SUM(COALESCE(p.pending_total, 0)), 0) AS pending
+        FROM fighters f
+        LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
+        LEFT JOIN pending p ON p.fighter_key = f.fighter_key
+        GROUP BY 1
+        ORDER BY owed DESC, earned DESC, gym_name ASC
+        """
+    )
+
+    top_rows = await bot.db.fetch(
+        """
+        WITH cashouts AS (
+            SELECT fighter_key, COALESCE(SUM(amount), 0) AS paid_total
+            FROM payout_cashouts
+            GROUP BY fighter_key
+        )
+        SELECT
+            f.fighter_name,
+            f.gym,
+            f.career_earnings,
+            COALESCE(c.paid_total, 0) AS paid,
+            GREATEST(f.career_earnings - COALESCE(c.paid_total, 0), 0) AS owed
+        FROM fighters f
+        LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
+        ORDER BY owed DESC, f.career_earnings DESC, f.fighter_name ASC
+        LIMIT 5
+        """
+    )
+
+    embed = discord.Embed(
+        title="🏦 OSBL TREASURY DASHBOARD",
+        description="Live financial exposure across the ONESTATE Boxing League.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="💰 Total Fighter Career Earnings",
+        value=f"**{_money(snap['career_earnings'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="✅ Total Actually Paid",
+        value=f"**{_money(snap['paid_out'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏦 Total Stacked / Owed",
+        value=f"**{_money(snap['stacked_balance'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳ Pending Payout Requests",
+        value=(
+            f"**{snap['pending_count']}** request(s)\n"
+            f"**{_money(snap['pending_total'])}** pending"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🧾 Completed Cashouts",
+        value=f"**{snap['cashout_count']}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🥊 Fighters Tracked",
+        value=f"**{snap['fighter_count']}**",
+        inline=True,
+    )
+
+    gym_lines = []
+    for row in gym_rows:
+        gym_lines.append(
+            f"**{row['gym_name']}** — Owed {_money(row['owed'])} • "
+            f"Paid {_money(row['paid'])} • Pending {_money(row['pending'])}"
+        )
+    embed.add_field(
+        name="🏢 Financial Exposure by Gym",
+        value="\n".join(gym_lines[:8]) if gym_lines else "No fighter financial data.",
+        inline=False,
+    )
+
+    top_lines = []
+    for i, row in enumerate(top_rows, start=1):
+        top_lines.append(
+            f"**#{i} {row['fighter_name']}** — {_money(row['owed'])} owed "
+            f"({row['gym']})"
+        )
+    embed.add_field(
+        name="📈 Largest Unpaid Fighter Balances",
+        value="\n".join(top_lines) if top_lines else "No unpaid fighter balances.",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"{PAYOUT_SYSTEM_VERSION} • Live data • Career earnings minus completed cashouts"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def gymtreasury(ctx, *, gym_name: str = None):
+    """Show the payout exposure for one gym."""
+    gym_name = " ".join(str(gym_name or "").strip().split())
+    if not gym_name:
+        await ctx.send("❌ Use: `!gymtreasury Gym Name`")
+        return
+
+    rows = await bot.db.fetch(
+        """
+        WITH cashouts AS (
+            SELECT fighter_key, COALESCE(SUM(amount), 0) AS paid_total
+            FROM payout_cashouts
+            GROUP BY fighter_key
+        ),
+        pending AS (
+            SELECT fighter_key, COALESCE(SUM(requested_amount), 0) AS pending_total
+            FROM payout_requests
+            WHERE status = 'pending'
+            GROUP BY fighter_key
+        )
+        SELECT
+            f.fighter_name,
+            f.division,
+            f.career_earnings,
+            COALESCE(c.paid_total, 0) AS paid,
+            GREATEST(f.career_earnings - COALESCE(c.paid_total, 0), 0) AS owed,
+            COALESCE(p.pending_total, 0) AS pending
+        FROM fighters f
+        LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
+        LEFT JOIN pending p ON p.fighter_key = f.fighter_key
+        WHERE LOWER(TRIM(f.gym)) = LOWER(TRIM($1))
+        ORDER BY owed DESC, f.career_earnings DESC, f.fighter_name ASC
+        """,
+        gym_name,
+    )
+
+    if not rows:
+        await ctx.send(f"❌ No fighters were found for gym **{gym_name}**.")
+        return
+
+    earned = sum(int(row["career_earnings"] or 0) for row in rows)
+    paid = sum(int(row["paid"] or 0) for row in rows)
+    owed = sum(int(row["owed"] or 0) for row in rows)
+    pending = sum(int(row["pending"] or 0) for row in rows)
+
+    embed = discord.Embed(
+        title=f"🏢 OSBL GYM TREASURY — {gym_name.upper()}",
+        description=f"Financial exposure for **{len(rows)} fighter(s)**.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="💰 Career Earnings", value=f"**{_money(earned)}**", inline=True)
+    embed.add_field(name="✅ Paid Out", value=f"**{_money(paid)}**", inline=True)
+    embed.add_field(name="🏦 Stacked / Owed", value=f"**{_money(owed)}**", inline=True)
+    embed.add_field(name="⏳ Pending", value=f"**{_money(pending)}**", inline=True)
+
+    fighter_lines = []
+    for row in rows[:15]:
+        fighter_lines.append(
+            f"**{row['fighter_name']}** — Owed {_money(row['owed'])} • "
+            f"Paid {_money(row['paid'])} • Pending {_money(row['pending'])}"
+        )
+    embed.add_field(
+        name="🥊 Fighter Balances",
+        value="\n".join(fighter_lines),
+        inline=False,
+    )
+    embed.set_footer(text=PAYOUT_SYSTEM_VERSION)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def treasurytop(ctx, limit: int = 10):
+    """Show the fighters with the largest unpaid balances."""
+    limit = max(1, min(int(limit or 10), 20))
+
+    rows = await bot.db.fetch(
+        """
+        WITH cashouts AS (
+            SELECT fighter_key, COALESCE(SUM(amount), 0) AS paid_total
+            FROM payout_cashouts
+            GROUP BY fighter_key
+        ),
+        pending AS (
+            SELECT fighter_key, COALESCE(SUM(requested_amount), 0) AS pending_total
+            FROM payout_requests
+            WHERE status = 'pending'
+            GROUP BY fighter_key
+        )
+        SELECT
+            f.fighter_name,
+            f.division,
+            f.gym,
+            f.career_earnings,
+            COALESCE(c.paid_total, 0) AS paid,
+            GREATEST(f.career_earnings - COALESCE(c.paid_total, 0), 0) AS owed,
+            COALESCE(p.pending_total, 0) AS pending
+        FROM fighters f
+        LEFT JOIN cashouts c ON c.fighter_key = f.fighter_key
+        LEFT JOIN pending p ON p.fighter_key = f.fighter_key
+        ORDER BY owed DESC, f.career_earnings DESC, f.fighter_name ASC
+        LIMIT $1
+        """,
+        limit,
+    )
+
+    if not rows:
+        await ctx.send("📈 No fighter treasury data is available.")
+        return
+
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        lines.append(
+            f"**#{i} {row['fighter_name']}** — Owed **{_money(row['owed'])}** • "
+            f"Paid {_money(row['paid'])} • Pending {_money(row['pending'])} • {row['gym']}"
+        )
+
+    embed = discord.Embed(
+        title="📈 OSBL TOP UNPAID BALANCES",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"{PAYOUT_SYSTEM_VERSION} • Highest stacked balances")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
