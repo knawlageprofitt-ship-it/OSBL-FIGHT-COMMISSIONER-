@@ -281,6 +281,91 @@ class OSBLBot(commands.Bot):
                 );
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS payout_ledger (
+                    id BIGSERIAL PRIMARY KEY,
+                    fight_history_id BIGINT NOT NULL,
+                    fight_night_session_id BIGINT,
+                    fighter_key TEXT NOT NULL,
+                    fighter_name TEXT NOT NULL,
+                    gym_name TEXT NOT NULL,
+                    division TEXT NOT NULL,
+                    fight_type TEXT NOT NULL,
+                    payout_role TEXT NOT NULL,
+                    progression_rank TEXT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    reversed_by_id BIGINT,
+                    reversed_by_name TEXT,
+                    reversed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (fight_history_id, fighter_key)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_ledger_fighter_idx
+                ON payout_ledger (fighter_key, created_at DESC);
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_ledger_session_idx
+                ON payout_ledger (fight_night_session_id, created_at DESC);
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_ledger_status_idx
+                ON payout_ledger (status, created_at DESC);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS payout_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    fighter_key TEXT NOT NULL,
+                    fighter_name TEXT NOT NULL,
+                    requested_amount BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    requested_by_id BIGINT NOT NULL,
+                    requested_by_name TEXT NOT NULL,
+                    approved_by_id BIGINT,
+                    approved_by_name TEXT,
+                    approved_at TIMESTAMPTZ,
+                    rejected_by_id BIGINT,
+                    rejected_by_name TEXT,
+                    rejected_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_requests_fighter_idx
+                ON payout_requests (fighter_key, created_at DESC);
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_requests_status_idx
+                ON payout_requests (status, created_at DESC);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS payout_cashouts (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id BIGINT,
+                    fighter_key TEXT NOT NULL,
+                    fighter_name TEXT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    paid_by_id BIGINT NOT NULL,
+                    paid_by_name TEXT NOT NULL,
+                    note TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS payout_cashouts_fighter_idx
+                ON payout_cashouts (fighter_key, created_at DESC);
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -427,6 +512,7 @@ GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
+PAYOUT_SYSTEM_VERSION = "V2-PAYOUT-BANK-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -451,6 +537,9 @@ async def systemcheck(ctx):
         "gym_management_log",
         "gym_season_history",
         "test_cleanup_audit_log",
+        "payout_ledger",
+        "payout_requests",
+        "payout_cashouts",
     ]
 
     try:
@@ -567,6 +656,16 @@ async def systemcheck(ctx):
         "deletetestseason",
         "confirmdeletetestseason",
         "databasebackup",
+        "payoutdesk",
+        "fightpayout",
+        "fighterpayout",
+        "payoutreport",
+        "payoutaudit",
+        "fighterbank",
+        "payoutrequest",
+        "payoutrequests",
+        "payfighter",
+        "rejectpayout",
     ]
 
     missing_commands = []
@@ -660,6 +759,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="💾 Database Backup",
         value=f"**{DATABASE_BACKUP_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="💰 Payout System",
+        value=f"**{PAYOUT_SYSTEM_VERSION}**",
         inline=False,
     )
 
@@ -3668,6 +3772,7 @@ async def confirmdeletetestfighter(ctx, *, fighter_name: str = None):
             ids = [int(r["id"]) for r in history_ids]
             deleted_history = len(ids)
             if ids:
+                await conn.execute("DELETE FROM payout_ledger WHERE fight_history_id = ANY($1::bigint[])", ids)
                 await conn.execute("DELETE FROM undo_audit_log WHERE fight_history_id = ANY($1::bigint[])", ids)
                 await conn.execute("DELETE FROM result_override_log WHERE duplicate_history_id = ANY($1::bigint[])", ids)
             await conn.execute("DELETE FROM undo_audit_log WHERE winner_key = $1 OR loser_key = $1", key)
@@ -3926,7 +4031,7 @@ async def result(ctx, *, details: str = None):
 
        async with conn.transaction():
 
-           await conn.execute(
+           history_id = await conn.fetchval(
             """
             INSERT INTO fight_history (
                 fight_type,
@@ -3958,6 +4063,7 @@ async def result(ctx, *, details: str = None):
                 $14, $15,
                 $16
             )
+            RETURNING id
             """,
             winner_key,
             loser_key,
@@ -4008,6 +4114,51 @@ async def result(ctx, *, details: str = None):
      loser_purse,
      loser_key
  )
+
+           await conn.executemany(
+            """
+            INSERT INTO payout_ledger (
+                fight_history_id,
+                fight_night_session_id,
+                fighter_key,
+                fighter_name,
+                gym_name,
+                division,
+                fight_type,
+                payout_role,
+                progression_rank,
+                amount
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (fight_history_id, fighter_key) DO NOTHING
+            """,
+            [
+                (
+                    history_id,
+                    fight_night_session_id,
+                    winner_key,
+                    winner["fighter_name"],
+                    winner["gym"],
+                    winner["division"],
+                    "regular",
+                    "winner",
+                    winner_progression,
+                    winner_purse,
+                ),
+                (
+                    history_id,
+                    fight_night_session_id,
+                    loser_key,
+                    loser["fighter_name"],
+                    loser["gym"],
+                    loser["division"],
+                    "regular",
+                    "loser",
+                    loser_progression,
+                    loser_purse,
+                ),
+            ],
+           )
 
     await update_division_rankings(winner["division"])
     bonuses_text = "\n".join(bonuses) if bonuses else "None"
@@ -4303,7 +4454,7 @@ async def champresult(ctx, *, details: str = None):
         )
 
         async with conn.transaction():
-            await conn.execute(
+            history_id = await conn.fetchval(
                     """
                     INSERT INTO fight_history (
                         fight_type,
@@ -4335,6 +4486,7 @@ async def champresult(ctx, *, details: str = None):
                         $14, $15,
                         $16
                     )
+                    RETURNING id
                     """,
                     winner_key,
                     loser_key,
@@ -4388,6 +4540,51 @@ async def champresult(ctx, *, details: str = None):
                 loser_progression,
                 loser_purse,
                 loser_key
+            )
+
+            await conn.executemany(
+                """
+                INSERT INTO payout_ledger (
+                    fight_history_id,
+                    fight_night_session_id,
+                    fighter_key,
+                    fighter_name,
+                    gym_name,
+                    division,
+                    fight_type,
+                    payout_role,
+                    progression_rank,
+                    amount
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT (fight_history_id, fighter_key) DO NOTHING
+                """,
+                [
+                    (
+                        history_id,
+                        fight_night_session_id,
+                        winner_key,
+                        winner["fighter_name"],
+                        winner["gym"],
+                        winner["division"],
+                        "championship",
+                        "winner",
+                        winner_progression,
+                        winner_purse,
+                    ),
+                    (
+                        history_id,
+                        fight_night_session_id,
+                        loser_key,
+                        loser["fighter_name"],
+                        loser["gym"],
+                        loser["division"],
+                        "championship",
+                        "loser",
+                        loser_progression,
+                        loser_purse,
+                    ),
+                ],
             )
 
             if duplicate and force_override:
@@ -4968,6 +5165,21 @@ async def confirmundo(ctx, fight_id: int):
 
             await conn.execute(
                 """
+                UPDATE payout_ledger
+                SET status = 'reversed',
+                    reversed_by_id = $2,
+                    reversed_by_name = $3,
+                    reversed_at = NOW()
+                WHERE fight_history_id = $1
+                  AND status = 'active'
+                """,
+                fight_id,
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+            await conn.execute(
+                """
                 INSERT INTO undo_audit_log (
                     fight_history_id,
                     commissioner_id,
@@ -5242,6 +5454,717 @@ async def undolog(ctx, limit: int = 10):
     )
 
     await ctx.send(embed=embed)
+
+
+# =========================================================
+# OSBL PAYOUT / FINANCIAL TRACKING SYSTEM
+# =========================================================
+
+def _money(value):
+    return f"${int(value or 0):,}"
+
+
+
+async def _fighter_bank_snapshot(fighter_key):
+    fighter = await bot.db.fetchrow(
+        """
+        SELECT fighter_key, fighter_name, division, gym, career_earnings
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+    if not fighter:
+        return None
+
+    paid = await bot.db.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS paid_out_count,
+            COALESCE(SUM(amount), 0) AS total_paid_out,
+            MAX(created_at) AS last_paid_at
+        FROM payout_cashouts
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+
+    pending = await bot.db.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS pending_count,
+            COALESCE(SUM(requested_amount), 0) AS pending_total
+        FROM payout_requests
+        WHERE fighter_key = $1
+          AND status = 'pending'
+        """,
+        fighter_key,
+    )
+
+    career = int(fighter["career_earnings"] or 0)
+    total_paid = int(paid["total_paid_out"] or 0)
+    pending_total = int(pending["pending_total"] or 0)
+
+    return {
+        "fighter": fighter,
+        "career_earnings": career,
+        "total_paid_out": total_paid,
+        "paid_out_count": int(paid["paid_out_count"] or 0),
+        "pending_total": pending_total,
+        "pending_count": int(pending["pending_count"] or 0),
+        "available_balance": max(0, career - total_paid),
+        "available_after_pending": max(0, career - total_paid - pending_total),
+        "last_paid_at": paid["last_paid_at"],
+    }
+
+
+@bot.command()
+async def fighterbank(ctx, *, fighter_name: str = None):
+    """Show earned, paid, pending and available OSBL money for a fighter."""
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!fighterbank Fighter Name`")
+        return
+
+    bank = await _fighter_bank_snapshot(fighter_name.casefold())
+    if not bank:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    fighter = bank["fighter"]
+    embed = discord.Embed(
+        title=f"🏦 OSBL FIGHTER BANK — {fighter['fighter_name']}",
+        description=f"{fighter['division']} • {fighter['gym']}",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="💰 Total Career Earnings",
+        value=f"**{_money(bank['career_earnings'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="✅ Actually Paid Out",
+        value=f"**{_money(bank['total_paid_out'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔢 Paid Out Count",
+        value=f"**{bank['paid_out_count']}** completed cashout(s)",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏦 Available / Stacked Balance",
+        value=f"**{_money(bank['available_balance'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳ Pending Requests",
+        value=(
+            f"**{bank['pending_count']}** request(s)\n"
+            f"**{_money(bank['pending_total'])}** pending"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="💵 Available After Pending Requests",
+        value=f"**{_money(bank['available_after_pending'])}**",
+        inline=True,
+    )
+    embed.set_footer(
+        text=f"{PAYOUT_SYSTEM_VERSION} • Earnings may stack until a payout is approved"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def payoutrequest(ctx, *, request_text: str = None):
+    """
+    Create a payout request.
+    Usage:
+      !payoutrequest Fighter Name | 100000
+      !payoutrequest Fighter Name | all
+    """
+    request_text = str(request_text or "").strip()
+    if "|" not in request_text:
+        await ctx.send(
+            "❌ Use: `!payoutrequest Fighter Name | Amount`\n"
+            "Example: `!payoutrequest Killswitch | 50000`\n"
+            "Or: `!payoutrequest Killswitch | all`"
+        )
+        return
+
+    fighter_name, amount_text = [part.strip() for part in request_text.split("|", 1)]
+    fighter_key = fighter_name.casefold()
+    bank = await _fighter_bank_snapshot(fighter_key)
+    if not bank:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    amount_text_clean = amount_text.replace("$", "").replace(",", "").strip().casefold()
+    if amount_text_clean in {"all", "max", "full"}:
+        amount = bank["available_after_pending"]
+    else:
+        try:
+            amount = int(amount_text_clean)
+        except ValueError:
+            await ctx.send("❌ Amount must be a whole-dollar number or `all`.")
+            return
+
+    if amount <= 0:
+        await ctx.send("❌ Requested payout amount must be greater than $0.")
+        return
+
+    if amount > bank["available_after_pending"]:
+        await ctx.send(
+            "❌ **PAYOUT REQUEST EXCEEDS AVAILABLE BALANCE**\n"
+            f"Available after pending requests: **{_money(bank['available_after_pending'])}**"
+        )
+        return
+
+    request_id = await bot.db.fetchval(
+        """
+        INSERT INTO payout_requests (
+            fighter_key,
+            fighter_name,
+            requested_amount,
+            requested_by_id,
+            requested_by_name
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        RETURNING id
+        """,
+        fighter_key,
+        bank["fighter"]["fighter_name"],
+        amount,
+        ctx.author.id,
+        ctx.author.display_name,
+    )
+
+    await ctx.send(
+        "🧾 **OSBL PAYOUT REQUEST SUBMITTED**\n"
+        f"Request ID: **#{request_id}**\n"
+        f"Fighter: **{bank['fighter']['fighter_name']}**\n"
+        f"Requested: **{_money(amount)}**\n"
+        f"Stacked balance before request: **{_money(bank['available_balance'])}**\n"
+        f"Status: **PENDING**\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def payoutrequests(ctx):
+    rows = await bot.db.fetch(
+        """
+        SELECT id, fighter_name, requested_amount, requested_by_name, created_at
+        FROM payout_requests
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT 25
+        """
+    )
+    if not rows:
+        await ctx.send(
+            "✅ **OSBL PAYOUT REQUESTS**\nNo pending payout requests.\n"
+            f"`{PAYOUT_SYSTEM_VERSION}`"
+        )
+        return
+
+    lines = [
+        f"**#{row['id']}** • **{row['fighter_name']}** • "
+        f"{_money(row['requested_amount'])} • requested by {row['requested_by_name']}"
+        for row in rows
+    ]
+    embed = discord.Embed(
+        title="🧾 OSBL PENDING PAYOUT REQUESTS",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"{PAYOUT_SYSTEM_VERSION} • Use !payfighter <Request ID>")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def payfighter(ctx, request_id: int = None):
+    """Mark a pending payout request as actually paid."""
+    if request_id is None:
+        await ctx.send("❌ Use: `!payfighter <Request ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            req = await conn.fetchrow(
+                """
+                SELECT *
+                FROM payout_requests
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                request_id,
+            )
+            if not req:
+                await ctx.send(f"❌ Payout Request **#{request_id}** was not found.")
+                return
+            if req["status"] != "pending":
+                await ctx.send(
+                    f"❌ Payout Request **#{request_id}** is already "
+                    f"**{str(req['status']).upper()}**."
+                )
+                return
+
+            bank = await _fighter_bank_snapshot(req["fighter_key"])
+            if not bank:
+                await ctx.send("❌ Fighter no longer exists in the OSBL database.")
+                return
+
+            # Pending total includes this request. Compare against the actual
+            # unpaid balance (career earnings - completed cashouts).
+            if int(req["requested_amount"]) > bank["available_balance"]:
+                await ctx.send(
+                    "❌ **PAYOUT BLOCKED — INSUFFICIENT UNPAID EARNINGS**\n"
+                    f"Current unpaid balance: **{_money(bank['available_balance'])}**"
+                )
+                return
+
+            cashout_id = await conn.fetchval(
+                """
+                INSERT INTO payout_cashouts (
+                    request_id,
+                    fighter_key,
+                    fighter_name,
+                    amount,
+                    paid_by_id,
+                    paid_by_name
+                )
+                VALUES ($1,$2,$3,$4,$5,$6)
+                RETURNING id
+                """,
+                req["id"],
+                req["fighter_key"],
+                req["fighter_name"],
+                req["requested_amount"],
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+            await conn.execute(
+                """
+                UPDATE payout_requests
+                SET status = 'paid',
+                    approved_by_id = $2,
+                    approved_by_name = $3,
+                    approved_at = NOW()
+                WHERE id = $1
+                """,
+                request_id,
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+    bank_after = await _fighter_bank_snapshot(req["fighter_key"])
+    await ctx.send(
+        "✅ **OSBL FIGHTER PAYOUT COMPLETED**\n"
+        f"Cashout ID: **#{cashout_id}**\n"
+        f"Request ID: **#{request_id}**\n"
+        f"Fighter: **{req['fighter_name']}**\n"
+        f"Actually Paid: **{_money(req['requested_amount'])}**\n"
+        f"Total Paid Out: **{_money(bank_after['total_paid_out'])}**\n"
+        f"Paid Out Count: **{bank_after['paid_out_count']}**\n"
+        f"Remaining Stacked Balance: **{_money(bank_after['available_balance'])}**\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def rejectpayout(ctx, request_id: int = None):
+    if request_id is None:
+        await ctx.send("❌ Use: `!rejectpayout <Request ID>`")
+        return
+
+    result = await bot.db.execute(
+        """
+        UPDATE payout_requests
+        SET status = 'rejected',
+            rejected_by_id = $2,
+            rejected_by_name = $3,
+            rejected_at = NOW()
+        WHERE id = $1
+          AND status = 'pending'
+        """,
+        request_id,
+        ctx.author.id,
+        ctx.author.display_name,
+    )
+
+    if result.endswith("0"):
+        await ctx.send(
+            f"❌ Payout Request **#{request_id}** was not found or is not pending."
+        )
+        return
+
+    await ctx.send(
+        f"🚫 **PAYOUT REQUEST #{request_id} REJECTED**\n"
+        f"Rejected by **{ctx.author.display_name}**\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+async def payoutdesk(ctx):
+    """Show the active OSBL purse schedule currently used by the result commands."""
+    ladder = [
+        ("Prospect", 50000, 25000),
+        ("Rising Prospect", 75000, 35000),
+        ("Contender", 100000, 50000),
+        ("Top Contender", 150000, 75000),
+        ("Elite Contender", 225000, 100000),
+        ("#1 Contender", 350000, 150000),
+    ]
+
+    lines = []
+    for rank, show, bonus in ladder:
+        lines.append(
+            f"**{rank}** — Show {_money(show)} • Win Bonus {_money(bonus)} • "
+            f"Winner Total {_money(show + bonus)}"
+        )
+
+    embed = discord.Embed(
+        title="💰 OSBL OFFICIAL PAYOUT DESK",
+        description=(
+            "Current purse schedule used automatically by OSBL fight-result commands.\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🏆 Championship",
+        value=(
+            f"Champion / Championship Winner: **{_money(5000000)}**\n"
+            f"Championship Opponent: **{_money(500000)}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📒 Financial Tracking",
+        value=(
+            "Every new official result is written to the payout ledger automatically. "
+            "If that result is undone, its ledger entries are marked **REVERSED**."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{PAYOUT_SYSTEM_VERSION} • Live purse schedule")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def fightpayout(ctx, history_id: int = None):
+    if history_id is None:
+        await ctx.send("❌ Use: `!fightpayout <History ID>`")
+        return
+
+    fight = await bot.db.fetchrow(
+        """
+        SELECT id, fight_type, winner_key, loser_key, score, undone, created_at
+        FROM fight_history
+        WHERE id = $1
+        """,
+        history_id,
+    )
+    if not fight:
+        await ctx.send(f"❌ Fight History ID **#{history_id}** was not found.")
+        return
+
+    rows = await bot.db.fetch(
+        """
+        SELECT fighter_name, gym_name, division, payout_role, progression_rank,
+               amount, status, created_at
+        FROM payout_ledger
+        WHERE fight_history_id = $1
+        ORDER BY CASE WHEN payout_role = 'winner' THEN 0 ELSE 1 END, id
+        """,
+        history_id,
+    )
+
+    if not rows:
+        await ctx.send(
+            f"📒 **Fight #{history_id} has no payout-ledger entries.**\n"
+            "This result may predate the payout-ledger system.\n"
+            f"`{PAYOUT_SYSTEM_VERSION}`"
+        )
+        return
+
+    total = sum(int(row["amount"]) for row in rows if row["status"] == "active")
+    embed = discord.Embed(
+        title=f"💰 OSBL FIGHT PAYOUT — HISTORY #{history_id}",
+        description=(
+            f"Type: **{str(fight['fight_type']).title()}** • Score: **{fight['score']}**\n"
+            f"Result Status: **{'REVERSED' if fight['undone'] else 'ACTIVE'}**"
+        ),
+        color=discord.Color.gold(),
+    )
+
+    for row in rows:
+        role = "🏆 Winner" if row["payout_role"] == "winner" else "🥊 Opponent"
+        embed.add_field(
+            name=role,
+            value=(
+                f"**{row['fighter_name']}**\n"
+                f"{row['division']} • {row['gym_name']}\n"
+                f"Progression: **{row['progression_rank']}**\n"
+                f"Payout: **{_money(row['amount'])}**\n"
+                f"Ledger Status: **{str(row['status']).upper()}**"
+            ),
+            inline=False,
+        )
+
+    embed.add_field(
+        name="💵 Active Fight Payout Total",
+        value=f"**{_money(total)}**",
+        inline=False,
+    )
+    embed.set_footer(text=PAYOUT_SYSTEM_VERSION)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def fighterpayout(ctx, *, fighter_name: str = None):
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!fighterpayout Fighter Name`")
+        return
+
+    key = fighter_name.casefold()
+    fighter = await bot.db.fetchrow(
+        """
+        SELECT fighter_key, fighter_name, division, gym, career_earnings
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        key,
+    )
+    if not fighter:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    summary = await bot.db.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'active') AS active_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'active'), 0) AS active_total,
+            COUNT(*) FILTER (WHERE status = 'reversed') AS reversed_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'reversed'), 0) AS reversed_total,
+            MAX(created_at) AS latest_payout_at
+        FROM payout_ledger
+        WHERE fighter_key = $1
+        """,
+        key,
+    )
+
+    recent = await bot.db.fetch(
+        """
+        SELECT fight_history_id, fight_type, payout_role, amount, status, created_at
+        FROM payout_ledger
+        WHERE fighter_key = $1
+        ORDER BY id DESC
+        LIMIT 5
+        """,
+        key,
+    )
+
+    recent_lines = []
+    for row in recent:
+        recent_lines.append(
+            f"#{row['fight_history_id']} • {str(row['fight_type']).title()} • "
+            f"{str(row['payout_role']).title()} • **{_money(row['amount'])}** • "
+            f"{str(row['status']).upper()}"
+        )
+
+    embed = discord.Embed(
+        title=f"💵 OSBL FIGHTER PAYOUT PROFILE — {fighter['fighter_name']}",
+        description=f"{fighter['division']} • {fighter['gym']}",
+        color=discord.Color.gold(),
+    )
+    bank = await _fighter_bank_snapshot(key)
+
+    embed.add_field(
+        name="🏦 Official Career Earnings",
+        value=f"**{_money(fighter['career_earnings'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="✅ Actually Paid Out",
+        value=f"**{_money(bank['total_paid_out'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔢 Paid Out Count",
+        value=f"**{bank['paid_out_count']}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="💵 Current Stacked Balance",
+        value=f"**{_money(bank['available_balance'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳ Pending Payout Requests",
+        value=f"**{_money(bank['pending_total'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="📒 Payout Ledger Since Tracking Began",
+        value=(
+            f"Active Entries: **{summary['active_entries']}**\n"
+            f"Tracked Active Payouts: **{_money(summary['active_total'])}**\n"
+            f"Reversed Entries: **{summary['reversed_entries']}**\n"
+            f"Reversed Payout Value: **{_money(summary['reversed_total'])}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🧾 Recent Ledger Entries",
+        value="\n".join(recent_lines) if recent_lines else "No payout-ledger entries yet.",
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"{PAYOUT_SYSTEM_VERSION} • Career earnings remain authoritative for pre-ledger fights"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def payoutreport(ctx, session_id: int = None):
+    """
+    Show financial totals for one fight-night session.
+    If no session is supplied, use the newest session.
+    """
+    if session_id is None:
+        session_id = await bot.db.fetchval(
+            "SELECT id FROM fight_night_sessions ORDER BY id DESC LIMIT 1"
+        )
+    if session_id is None:
+        await ctx.send("📒 No fight-night sessions exist yet.")
+        return
+
+    session = await bot.db.fetchrow(
+        """
+        SELECT id, status, started_at, ended_at, started_by_name, ended_by_name
+        FROM fight_night_sessions
+        WHERE id = $1
+        """,
+        session_id,
+    )
+    if not session:
+        await ctx.send(f"❌ Fight Night Session **#{session_id}** was not found.")
+        return
+
+    totals = await bot.db.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'active') AS active_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'active'), 0) AS active_total,
+            COALESCE(SUM(amount) FILTER (
+                WHERE status = 'active' AND payout_role = 'winner'
+            ), 0) AS winner_total,
+            COALESCE(SUM(amount) FILTER (
+                WHERE status = 'active' AND payout_role = 'loser'
+            ), 0) AS opponent_total,
+            COUNT(*) FILTER (WHERE status = 'reversed') AS reversed_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'reversed'), 0) AS reversed_total
+        FROM payout_ledger
+        WHERE fight_night_session_id = $1
+        """,
+        session_id,
+    )
+
+    gym_rows = await bot.db.fetch(
+        """
+        SELECT gym_name, COALESCE(SUM(amount), 0) AS gym_total
+        FROM payout_ledger
+        WHERE fight_night_session_id = $1
+          AND status = 'active'
+        GROUP BY gym_name
+        ORDER BY gym_total DESC, gym_name ASC
+        """,
+        session_id,
+    )
+
+    gym_lines = [
+        f"**{row['gym_name']}** — {_money(row['gym_total'])}"
+        for row in gym_rows
+    ]
+
+    embed = discord.Embed(
+        title=f"💰 OSBL FIGHT NIGHT PAYOUT REPORT — SESSION #{session_id}",
+        description=f"Session Status: **{str(session['status']).upper()}**",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="💵 Active Payout Totals",
+        value=(
+            f"Total Paid: **{_money(totals['active_total'])}**\n"
+            f"Winner Payouts: **{_money(totals['winner_total'])}**\n"
+            f"Opponent Payouts: **{_money(totals['opponent_total'])}**\n"
+            f"Ledger Entries: **{totals['active_entries']}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="↩️ Reversed",
+        value=(
+            f"Entries: **{totals['reversed_entries']}**\n"
+            f"Reversed Value: **{_money(totals['reversed_total'])}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏢 Active Payouts by Gym",
+        value="\n".join(gym_lines) if gym_lines else "No tracked payouts in this session.",
+        inline=False,
+    )
+    embed.set_footer(text=PAYOUT_SYSTEM_VERSION)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def payoutaudit(ctx, limit: int = 10):
+    limit = max(1, min(int(limit or 10), 20))
+    rows = await bot.db.fetch(
+        """
+        SELECT id, fight_history_id, fighter_name, gym_name, fight_type,
+               payout_role, amount, status, created_at
+        FROM payout_ledger
+        ORDER BY id DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        await ctx.send(
+            "📒 **OSBL PAYOUT AUDIT**\nNo payout-ledger entries exist yet.\n"
+            f"`{PAYOUT_SYSTEM_VERSION}`"
+        )
+        return
+
+    lines = []
+    for row in rows:
+        lines.append(
+            f"**L#{row['id']}** • Fight #{row['fight_history_id']} • "
+            f"**{row['fighter_name']}** • {_money(row['amount'])} • "
+            f"{str(row['status']).upper()}"
+        )
+
+    embed = discord.Embed(
+        title="📒 OSBL PAYOUT AUDIT",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"{PAYOUT_SYSTEM_VERSION} • Showing newest {len(rows)}")
+    await ctx.send(embed=embed)
+
 
 # =========================================================
 # OSBL DATABASE BACKUP SYSTEM
