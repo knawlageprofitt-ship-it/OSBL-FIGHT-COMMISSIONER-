@@ -366,6 +366,23 @@ class OSBLBot(commands.Bot):
                 ON payout_cashouts (fighter_key, created_at DESC);
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fighter_discord_links (
+                    fighter_key TEXT PRIMARY KEY,
+                    fighter_name TEXT NOT NULL,
+                    discord_user_id BIGINT NOT NULL UNIQUE,
+                    linked_by_id BIGINT NOT NULL,
+                    linked_by_name TEXT NOT NULL,
+                    linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS fighter_discord_links_user_idx
+                ON fighter_discord_links (discord_user_id);
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -512,7 +529,7 @@ GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
-PAYOUT_SYSTEM_VERSION = "V2-PAYOUT-BANK-2026-09-08"
+PAYOUT_SYSTEM_VERSION = "V4-PLAYER-RECEIPTS-2026-09-08"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -540,6 +557,7 @@ async def systemcheck(ctx):
         "payout_ledger",
         "payout_requests",
         "payout_cashouts",
+        "fighter_discord_links",
     ]
 
     try:
@@ -666,6 +684,11 @@ async def systemcheck(ctx):
         "payoutrequests",
         "payfighter",
         "rejectpayout",
+        "payoutstatement",
+        "linkfighterdiscord",
+        "fighterdiscord",
+        "unlinkfighterdiscord",
+        "resendreceipt",
     ]
 
     missing_commands = []
@@ -5763,6 +5786,22 @@ async def payfighter(ctx, request_id: int = None):
             )
 
     bank_after = await _fighter_bank_snapshot(req["fighter_key"])
+    receipt_sent, receipt_detail = await _send_payout_receipt_to_fighter(cashout_id)
+
+    if receipt_sent:
+        receipt_status = f"📩 Receipt: **SENT to {receipt_detail}**"
+    elif receipt_detail == "not_linked":
+        receipt_status = (
+            "⚠️ Receipt: **NOT SENT — no Discord account linked**\n"
+            "Use `!linkfighterdiscord Fighter Name | @DiscordUser`."
+        )
+    elif receipt_detail == "dm_failed":
+        receipt_status = (
+            "⚠️ Receipt: **NOT DELIVERED — player DMs may be disabled**"
+        )
+    else:
+        receipt_status = "⚠️ Receipt: **Could not be generated**"
+
     await ctx.send(
         "✅ **OSBL FIGHTER PAYOUT COMPLETED**\n"
         f"Cashout ID: **#{cashout_id}**\n"
@@ -5772,6 +5811,7 @@ async def payfighter(ctx, request_id: int = None):
         f"Total Paid Out: **{_money(bank_after['total_paid_out'])}**\n"
         f"Paid Out Count: **{bank_after['paid_out_count']}**\n"
         f"Remaining Stacked Balance: **{_money(bank_after['available_balance'])}**\n"
+        f"{receipt_status}\n"
         f"`{PAYOUT_SYSTEM_VERSION}`"
     )
 
@@ -5809,6 +5849,428 @@ async def rejectpayout(ctx, request_id: int = None):
         f"Rejected by **{ctx.author.display_name}**\n"
         f"`{PAYOUT_SYSTEM_VERSION}`"
     )
+
+
+
+
+async def _get_fighter_discord_link(fighter_key):
+    return await bot.db.fetchrow(
+        """
+        SELECT fighter_key, fighter_name, discord_user_id, linked_by_name, linked_at
+        FROM fighter_discord_links
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+
+
+def _parse_discord_user_id(raw_value):
+    value = str(raw_value or "").strip()
+    match = re.fullmatch(r"<@!?(\d+)>", value)
+    if match:
+        return int(match.group(1))
+    if value.isdigit():
+        return int(value)
+    return None
+
+
+async def _build_payout_receipt_embed(cashout_id):
+    cashout = await bot.db.fetchrow(
+        """
+        SELECT id, request_id, fighter_key, fighter_name, amount,
+               paid_by_name, created_at
+        FROM payout_cashouts
+        WHERE id = $1
+        """,
+        cashout_id,
+    )
+    if not cashout:
+        return None, None
+
+    bank = await _fighter_bank_snapshot(cashout["fighter_key"])
+    if not bank:
+        return None, cashout
+
+    fighter = bank["fighter"]
+    embed = discord.Embed(
+        title="🧾 OSBL OFFICIAL PAYOUT RECEIPT",
+        description=(
+            f"**{fighter['fighter_name']}**\n"
+            f"{fighter['division']} • {fighter['gym']}"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="✅ Transaction Status",
+        value="**PAID**",
+        inline=True,
+    )
+    embed.add_field(
+        name="💵 Amount Paid",
+        value=f"**{_money(cashout['amount'])}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🧾 Transaction",
+        value=(
+            f"Cashout ID: **#{cashout['id']}**\n"
+            f"Request ID: **#{cashout['request_id']}**"
+            if cashout["request_id"] is not None
+            else f"Cashout ID: **#{cashout['id']}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏦 Fighter Bank After Payment",
+        value=(
+            f"Career Earnings: **{_money(bank['career_earnings'])}**\n"
+            f"Total Paid Out: **{_money(bank['total_paid_out'])}**\n"
+            f"Paid Out Count: **{bank['paid_out_count']}**\n"
+            f"Remaining Stacked Balance: **{_money(bank['available_balance'])}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="👤 Processed By",
+        value=f"**{cashout['paid_by_name']}**",
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"{PAYOUT_SYSTEM_VERSION} • ONE LEAGUE. ONE STANDARD. ONE CHAMPION."
+    )
+    return embed, cashout
+
+
+async def _send_payout_receipt_to_fighter(cashout_id):
+    embed, cashout = await _build_payout_receipt_embed(cashout_id)
+    if not cashout:
+        return False, "cashout_not_found"
+    if embed is None:
+        return False, "fighter_not_found"
+
+    link = await _get_fighter_discord_link(cashout["fighter_key"])
+    if not link:
+        return False, "not_linked"
+
+    user_id = int(link["discord_user_id"])
+    try:
+        user = bot.get_user(user_id)
+        if user is None:
+            user = await bot.fetch_user(user_id)
+        await user.send(embed=embed)
+        return True, user
+    except (discord.Forbidden, discord.HTTPException):
+        return False, "dm_failed"
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def linkfighterdiscord(ctx, *, link_text: str = None):
+    """
+    Link one OSBL fighter to one Discord account.
+    Usage: !linkfighterdiscord Killswitch | @DiscordUser
+    """
+    link_text = str(link_text or "").strip()
+    if "|" not in link_text:
+        await ctx.send(
+            "❌ Use: `!linkfighterdiscord Fighter Name | @DiscordUser`\n"
+            "Example: `!linkfighterdiscord Killswitch | @PlayerName`"
+        )
+        return
+
+    fighter_name, user_text = [part.strip() for part in link_text.split("|", 1)]
+    fighter_key = fighter_name.casefold()
+    fighter = await bot.db.fetchrow(
+        """
+        SELECT fighter_key, fighter_name, division, gym
+        FROM fighters
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+    if not fighter:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    user_id = _parse_discord_user_id(user_text)
+    if user_id is None:
+        await ctx.send(
+            "❌ I couldn't read that Discord account.\n"
+            "Use an actual Discord mention, for example: `@PlayerName`."
+        )
+        return
+
+    try:
+        user = bot.get_user(user_id)
+        if user is None:
+            user = await bot.fetch_user(user_id)
+    except discord.HTTPException:
+        await ctx.send("❌ Discord user could not be resolved.")
+        return
+
+    existing_for_user = await bot.db.fetchrow(
+        """
+        SELECT fighter_name
+        FROM fighter_discord_links
+        WHERE discord_user_id = $1
+          AND fighter_key <> $2
+        """,
+        user_id,
+        fighter_key,
+    )
+    if existing_for_user:
+        await ctx.send(
+            "❌ **DISCORD ACCOUNT ALREADY LINKED**\n"
+            f"That account is already linked to **{existing_for_user['fighter_name']}**."
+        )
+        return
+
+    await bot.db.execute(
+        """
+        INSERT INTO fighter_discord_links (
+            fighter_key,
+            fighter_name,
+            discord_user_id,
+            linked_by_id,
+            linked_by_name
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (fighter_key)
+        DO UPDATE SET
+            fighter_name = EXCLUDED.fighter_name,
+            discord_user_id = EXCLUDED.discord_user_id,
+            linked_by_id = EXCLUDED.linked_by_id,
+            linked_by_name = EXCLUDED.linked_by_name,
+            updated_at = NOW()
+        """,
+        fighter_key,
+        fighter["fighter_name"],
+        user_id,
+        ctx.author.id,
+        ctx.author.display_name,
+    )
+
+    await ctx.send(
+        "🔗 **OSBL FIGHTER DISCORD LINKED**\n"
+        f"Fighter: **{fighter['fighter_name']}**\n"
+        f"Discord: **{user}** (`{user_id}`)\n"
+        "✅ Future successful cashouts will automatically send this player "
+        "an official OSBL payout receipt by DM.\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+async def fighterdiscord(ctx, *, fighter_name: str = None):
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!fighterdiscord Fighter Name`")
+        return
+
+    fighter_key = fighter_name.casefold()
+    fighter = await bot.db.fetchrow(
+        "SELECT fighter_name FROM fighters WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if not fighter:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    link = await _get_fighter_discord_link(fighter_key)
+    if not link:
+        await ctx.send(
+            f"🔗 **{fighter['fighter_name']}** does not have a Discord account linked yet.\n"
+            f"`{PAYOUT_SYSTEM_VERSION}`"
+        )
+        return
+
+    await ctx.send(
+        "🔗 **OSBL FIGHTER DISCORD LINK**\n"
+        f"Fighter: **{fighter['fighter_name']}**\n"
+        f"Discord User ID: `{link['discord_user_id']}`\n"
+        f"Linked by: **{link['linked_by_name']}**\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def unlinkfighterdiscord(ctx, *, fighter_name: str = None):
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!unlinkfighterdiscord Fighter Name`")
+        return
+
+    fighter_key = fighter_name.casefold()
+    result = await bot.db.execute(
+        "DELETE FROM fighter_discord_links WHERE fighter_key = $1",
+        fighter_key,
+    )
+    if result.endswith("0"):
+        await ctx.send(f"❌ **{fighter_name}** does not currently have a Discord link.")
+        return
+
+    await ctx.send(
+        "🔓 **OSBL FIGHTER DISCORD LINK REMOVED**\n"
+        f"Fighter: **{fighter_name}**\n"
+        f"`{PAYOUT_SYSTEM_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def resendreceipt(ctx, cashout_id: int = None):
+    if cashout_id is None:
+        await ctx.send("❌ Use: `!resendreceipt <Cashout ID>`")
+        return
+
+    sent, detail = await _send_payout_receipt_to_fighter(cashout_id)
+    if sent:
+        await ctx.send(
+            "📩 **OSBL PAYOUT RECEIPT RESENT**\n"
+            f"Cashout ID: **#{cashout_id}**\n"
+            f"Delivered to: **{detail}**\n"
+            f"`{PAYOUT_SYSTEM_VERSION}`"
+        )
+        return
+
+    if detail == "not_linked":
+        await ctx.send(
+            "⚠️ Receipt was not sent because this fighter has no Discord account linked.\n"
+            "Use `!linkfighterdiscord Fighter Name | @DiscordUser` first."
+        )
+    elif detail == "dm_failed":
+        await ctx.send(
+            "⚠️ Receipt could not be delivered. The player's DMs may be disabled.\n"
+            "The payout itself is unchanged."
+        )
+    else:
+        await ctx.send(f"❌ Cashout **#{cashout_id}** could not be found or rebuilt.")
+
+
+@bot.command()
+async def payoutstatement(ctx, *, fighter_name: str = None):
+    """
+    Show a fighter's complete OSBL payout statement:
+    earnings, paid-out total/count, stacked balance, pending requests,
+    recent requests, completed cashouts, and rejected requests.
+    """
+    fighter_name = " ".join(str(fighter_name or "").strip().split())
+    if not fighter_name:
+        await ctx.send("❌ Use: `!payoutstatement Fighter Name`")
+        return
+
+    fighter_key = fighter_name.casefold()
+    bank = await _fighter_bank_snapshot(fighter_key)
+    if not bank:
+        await ctx.send(f"❌ Fighter **{fighter_name}** was not found.")
+        return
+
+    fighter = bank["fighter"]
+
+    request_rows = await bot.db.fetch(
+        """
+        SELECT id, requested_amount, status, requested_by_name,
+               approved_by_name, rejected_by_name, created_at,
+               approved_at, rejected_at
+        FROM payout_requests
+        WHERE fighter_key = $1
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        fighter_key,
+    )
+
+    cashout_rows = await bot.db.fetch(
+        """
+        SELECT id, request_id, amount, paid_by_name, note, created_at
+        FROM payout_cashouts
+        WHERE fighter_key = $1
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        fighter_key,
+    )
+
+    ledger_summary = await bot.db.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'active') AS active_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'active'), 0) AS active_total,
+            COUNT(*) FILTER (WHERE status = 'reversed') AS reversed_entries,
+            COALESCE(SUM(amount) FILTER (WHERE status = 'reversed'), 0) AS reversed_total
+        FROM payout_ledger
+        WHERE fighter_key = $1
+        """,
+        fighter_key,
+    )
+
+    request_lines = []
+    for row in request_rows:
+        status = str(row["status"]).upper()
+        extra = ""
+        if status == "PAID" and row["approved_by_name"]:
+            extra = f" • paid by {row['approved_by_name']}"
+        elif status == "REJECTED" and row["rejected_by_name"]:
+            extra = f" • rejected by {row['rejected_by_name']}"
+        request_lines.append(
+            f"**Req #{row['id']}** • {_money(row['requested_amount'])} • **{status}**{extra}"
+        )
+
+    cashout_lines = []
+    for row in cashout_rows:
+        cashout_lines.append(
+            f"**Cashout #{row['id']}** • Req #{row['request_id'] or '—'} • "
+            f"**{_money(row['amount'])}** • paid by {row['paid_by_name']}"
+        )
+
+    embed = discord.Embed(
+        title=f"📄 OSBL PAYOUT STATEMENT — {fighter['fighter_name']}",
+        description=f"{fighter['division']} • {fighter['gym']}",
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="🏦 Account Summary",
+        value=(
+            f"Career Earnings: **{_money(bank['career_earnings'])}**\n"
+            f"Actually Paid Out: **{_money(bank['total_paid_out'])}**\n"
+            f"Paid Out Count: **{bank['paid_out_count']}**\n"
+            f"Stacked Balance: **{_money(bank['available_balance'])}**\n"
+            f"Pending Requests: **{bank['pending_count']}** "
+            f"({_money(bank['pending_total'])})\n"
+            f"Available After Pending: **{_money(bank['available_after_pending'])}**"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🥊 Fight Earnings Ledger",
+        value=(
+            f"Active Payout Entries: **{ledger_summary['active_entries']}**\n"
+            f"Tracked Active Fight Payouts: **{_money(ledger_summary['active_total'])}**\n"
+            f"Reversed Entries: **{ledger_summary['reversed_entries']}**\n"
+            f"Reversed Value: **{_money(ledger_summary['reversed_total'])}**"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🧾 Recent Payout Requests",
+        value="\n".join(request_lines) if request_lines else "No payout requests yet.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="✅ Recent Completed Cashouts",
+        value="\n".join(cashout_lines) if cashout_lines else "No completed cashouts yet.",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"{PAYOUT_SYSTEM_VERSION} • Career earnings include pre-ledger OSBL earnings"
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.command()
