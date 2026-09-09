@@ -563,6 +563,7 @@ GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
 FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
 FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
+FIGHT_NIGHT_CLEANUP_VERSION = "V1-FIGHT-NIGHT-CLEANUP-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -681,6 +682,9 @@ async def systemcheck(ctx):
         "fightnightstatus",
         "fightnightrecap",
         "fightnightfinance",
+        "testfightnightlist",
+        "deletefightnight",
+        "confirmdeletefightnight",
         "fightnightlist",
         "endfightnight",
         "matchupcheck",
@@ -846,6 +850,11 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🧾 Fight Night Finance",
         value=f"**{FIGHT_NIGHT_FINANCE_VERSION}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧹 Fight Night Cleanup",
+        value=f"**{FIGHT_NIGHT_CLEANUP_VERSION}**",
         inline=False,
     )
 
@@ -2243,6 +2252,230 @@ async def fightnightlist(ctx):
     embed.set_footer(text="Use !fightnightrecap <Session ID> for the full archived card")
     await ctx.send(embed=embed)
 
+
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def testfightnightlist(ctx):
+    """
+    Read-only list of Fight Night sessions that appear to be test/simulation sessions.
+    Safety rule: only sessions whose name contains 'test', 'training', 'mock', or 'simulation'
+    are listed as deletion candidates.
+    """
+    rows = await bot.db.fetch(
+        """
+        SELECT id, session_name, status, started_at, ended_at,
+               started_by_name, ended_by_name, start_history_id, end_history_id
+        FROM fight_night_sessions
+        ORDER BY id DESC
+        """
+    )
+
+    keywords = ("test", "training", "mock", "simulation")
+    candidates = []
+    for row in rows:
+        name = str(row["session_name"] or "").casefold()
+        if any(k in name for k in keywords):
+            candidates.append(row)
+
+    if not candidates:
+        await ctx.send(
+            "🧹 **OSBL TEST FIGHT NIGHT LIST**\n"
+            "No Fight Night sessions currently match the safe test-session naming rules.\n"
+            f"`{FIGHT_NIGHT_CLEANUP_VERSION}`"
+        )
+        return
+
+    embed = discord.Embed(
+        title="🧹 OSBL TEST FIGHT NIGHT SESSIONS",
+        description=(
+            "Read-only list. Nothing has been deleted.\n"
+            "Only sessions explicitly named like test/training/mock/simulation are shown."
+        ),
+        color=discord.Color.orange(),
+    )
+
+    for row in candidates[:20]:
+        status = str(row["status"] or "").upper()
+        embed.add_field(
+            name=f"Session #{row['id']} — {row['session_name']}",
+            value=(
+                f"Status: **{status}**\n"
+                f"Opened by: **{row['started_by_name']}**\n"
+                f"Closed by: **{row['ended_by_name'] or '—'}**"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"{FIGHT_NIGHT_CLEANUP_VERSION} • Read-only")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def deletefightnight(ctx, session_id: int = None):
+    """
+    Preview a safe test Fight Night deletion.
+    Does not delete anything until confirmdeletefightnight is used.
+    """
+    if session_id is None:
+        await ctx.send("❌ Use: `!deletefightnight <Session ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT * FROM fight_night_sessions WHERE id = $1",
+            session_id,
+        )
+
+        if not session:
+            await ctx.send(f"❌ Fight Night Session **#{session_id}** was not found.")
+            return
+
+        name = str(session["session_name"] or "")
+        name_cf = name.casefold()
+        safe_keywords = ("test", "training", "mock", "simulation")
+
+        if not any(k in name_cf for k in safe_keywords):
+            await ctx.send(
+                "🛑 **DELETE BLOCKED**\n"
+                f"Session **#{session_id} — {name}** is not explicitly named as a test/training/mock/simulation session.\n"
+                "This cleanup tool will not delete real Fight Night sessions."
+            )
+            return
+
+        if str(session["status"]).casefold() == "active":
+            await ctx.send(
+                "🛑 **DELETE BLOCKED**\n"
+                "This Fight Night session is still active. End it first with `!endfightnight`."
+            )
+            return
+
+        snapshot_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM fight_night_financial_snapshots WHERE session_id = $1",
+            session_id,
+        )
+
+        fight_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM fight_history
+            WHERE fight_night_session_id = $1
+               OR (
+                    fight_night_session_id IS NULL
+                    AND id > $2
+                    AND ($3::BIGINT IS NULL OR id <= $3)
+               )
+            """,
+            session_id,
+            session["start_history_id"],
+            session["end_history_id"],
+        )
+
+        ledger_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM payout_ledger
+            WHERE fight_night_session_id = $1
+               OR (
+                    fight_night_session_id IS NULL
+                    AND fight_history_id > $2
+                    AND ($3::BIGINT IS NULL OR fight_history_id <= $3)
+               )
+            """,
+            session_id,
+            session["start_history_id"],
+            session["end_history_id"],
+        )
+
+    await ctx.send(
+        "⚠️ **CONFIRM TEST FIGHT NIGHT DELETE**\n"
+        f"Session: **#{session_id} — {name}**\n"
+        f"Fight records linked/in-range: **{fight_count}**\n"
+        f"Payout ledger rows linked/in-range: **{ledger_count}**\n"
+        f"Financial snapshots: **{snapshot_count}**\n\n"
+        "This permanently removes the **test Fight Night session and its frozen financial snapshot**.\n"
+        "It does **not** automatically delete fighter profiles.\n\n"
+        f"Confirm with: `!confirmdeletefightnight {session_id}`\n"
+        f"`{FIGHT_NIGHT_CLEANUP_VERSION}`"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def confirmdeletefightnight(ctx, session_id: int = None):
+    """
+    Permanently remove one explicitly-test Fight Night session and its snapshot.
+    Fight history and payout rows are preserved unless they are already deleted elsewhere.
+    """
+    if session_id is None:
+        await ctx.send("❌ Use: `!confirmdeletefightnight <Session ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            session = await conn.fetchrow(
+                "SELECT * FROM fight_night_sessions WHERE id = $1 FOR UPDATE",
+                session_id,
+            )
+
+            if not session:
+                await ctx.send(f"❌ Fight Night Session **#{session_id}** was not found.")
+                return
+
+            name = str(session["session_name"] or "")
+            name_cf = name.casefold()
+            safe_keywords = ("test", "training", "mock", "simulation")
+
+            if not any(k in name_cf for k in safe_keywords):
+                await ctx.send(
+                    "🛑 **DELETE BLOCKED**\n"
+                    f"Session **#{session_id} — {name}** is not explicitly named as a test/training/mock/simulation session."
+                )
+                return
+
+            if str(session["status"]).casefold() == "active":
+                await ctx.send(
+                    "🛑 **DELETE BLOCKED**\n"
+                    "This Fight Night session is still active. End it first with `!endfightnight`."
+                )
+                return
+
+            snapshot_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM fight_night_financial_snapshots WHERE session_id = $1",
+                session_id,
+            )
+
+            # Snapshot will also cascade when session is deleted,
+            # but delete explicitly for a clean audit flow.
+            await conn.execute(
+                "DELETE FROM fight_night_financial_snapshots WHERE session_id = $1",
+                session_id,
+            )
+
+            # Preserve fight_history/payout ledger audit records; detach them from this session.
+            await conn.execute(
+                "UPDATE fight_history SET fight_night_session_id = NULL WHERE fight_night_session_id = $1",
+                session_id,
+            )
+            await conn.execute(
+                "UPDATE payout_ledger SET fight_night_session_id = NULL WHERE fight_night_session_id = $1",
+                session_id,
+            )
+
+            await conn.execute(
+                "DELETE FROM fight_night_sessions WHERE id = $1",
+                session_id,
+            )
+
+    await ctx.send(
+        "✅ **TEST FIGHT NIGHT CLEANED UP**\n"
+        f"Removed Session: **#{session_id} — {name}**\n"
+        f"Financial snapshots removed: **{snapshot_count}**\n"
+        "Fight history and payout audit rows were **preserved** and detached from the deleted test session.\n"
+        f"`{FIGHT_NIGHT_CLEANUP_VERSION}`"
+    )
 
 
 @bot.command()
