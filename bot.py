@@ -558,7 +558,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V5-CHAMPIONSHIP-2026-09-07"
+POSTER_RENDERER_VERSION = "V7-CLEAN-TEMPLATE-FIGHT-CARDS-2026-09-09"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
@@ -697,6 +697,8 @@ async def systemcheck(ctx):
         "bookfight",
         "fightcard",
         "fightposter",
+        "fightcardposter",
+        "rerenderfightcard",
         "fightposterall",
         "lockfight",
         "cancelbookedfight",
@@ -888,6 +890,9 @@ FIGHT_CARD_TEMPLATE_FILES = {
     "Heavyweight": "osbl_heavyweight_fight_card.png",
 }
 
+# Premium universal regular-fight card. The renderer places the already-saved
+# fighter portraits and live booking data over this master design.
+PREMIUM_REGULAR_TEMPLATE_FILE = "osbl_official_fight_card_template.png"
 CHAMPIONSHIP_TEMPLATE_FILE = "osbl_championship_fight_card.png"
 
 
@@ -1075,7 +1080,10 @@ def _render_osbl_championship_poster(booking, fighter1, fighter2):
 
 
 def _render_osbl_fight_poster(booking, fighter1, fighter2):
-    """Return a polished PNG BytesIO for an OSBL matchup."""
+    """
+    Render the clean OSBL visual fight card.
+    All matchup information is placed INSIDE the poster itself.
+    """
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
@@ -1084,90 +1092,165 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
     if booking["bout_type"] == "championship":
         return _render_osbl_championship_poster(booking, fighter1, fighter2)
 
-    division = booking["division"]
-    template_filename = FIGHT_CARD_TEMPLATE_FILES.get(division)
-    if not template_filename:
-        raise RuntimeError(f"No fight-card template is configured for {division}.")
-
-    template_path = _fight_card_asset_path(template_filename)
+    template_path = _fight_card_asset_path(PREMIUM_REGULAR_TEMPLATE_FILE)
     if not template_path.exists():
-        raise RuntimeError(f"Missing template file: {template_filename}")
+        raise RuntimeError(
+            f"Missing premium fight-card template: {PREMIUM_REGULAR_TEMPLATE_FILE}"
+        )
 
     canvas = Image.open(template_path).convert("RGB")
-    if canvas.size != (1122, 1402):
-        canvas = canvas.resize((1122, 1402), Image.Resampling.LANCZOS)
+    if canvas.size != (1536, 1024):
+        canvas = canvas.resize((1536, 1024), Image.Resampling.LANCZOS)
+
     draw = ImageDraw.Draw(canvas)
 
-    # Portrait windows. Keep these inside the existing gold frames.
-    _paste_fighter_portrait(canvas, fighter1["photo_data"], (31, 372, 451, 891))
-    _paste_fighter_portrait(canvas, fighter2["photo_data"], (671, 372, 1091, 891))
+    gold = (232, 188, 80)
+    white = (252, 252, 252)
+    black = (5, 5, 5)
+    green = (75, 235, 115)
 
-    # Rebuild the entire lower information area instead of depending on any
-    # AI-baked placeholder text. This makes the live information readable on mobile.
-    gold = (224, 180, 72)
-    white = (250, 250, 250)
-    muted = (190, 190, 190)
-    black = (6, 6, 6)
+    # -----------------------------------------------------
+    # Fighter portrait windows
+    # -----------------------------------------------------
+    left_photo_box = (45, 155, 438, 590)
+    right_photo_box = (1098, 155, 1491, 590)
 
-    left_name = (25, 884, 458, 970)
-    right_name = (664, 884, 1097, 970)
-    for panel in (left_name, right_name):
-        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
+    _paste_fighter_portrait(canvas, fighter1["photo_data"], left_photo_box)
+    _paste_fighter_portrait(canvas, fighter2["photo_data"], right_photo_box)
+
+    # Thin inner framing so the pasted images look native to the template.
+    draw.rectangle(left_photo_box, outline=gold, width=3)
+    draw.rectangle(right_photo_box, outline=gold, width=3)
+
+    # -----------------------------------------------------
+    # Fighter names
+    # -----------------------------------------------------
+    left_name_box = (55, 597, 431, 647)
+    right_name_box = (1105, 597, 1481, 647)
+
+    _draw_panel(draw, left_name_box, fill=black, outline=gold, width=3)
+    _draw_panel(draw, right_name_box, fill=black, outline=gold, width=3)
 
     name1 = str(fighter1["fighter_name"]).upper()
     name2 = str(fighter2["fighter_name"]).upper()
-    font1 = _fit_font(draw, name1, 392, 52, 28)
-    font2 = _fit_font(draw, name2, 392, 52, 28)
-    _draw_centered(draw, (38, 895, 445, 958), name1, font1, fill=white, stroke=2)
-    _draw_centered(draw, (677, 895, 1084, 958), name2, font2, fill=white, stroke=2)
 
-    # Full stat panels with our own labels and values.
-    left_stats = (25, 969, 458, 1085)
-    right_stats = (664, 969, 1097, 1085)
-    for panel in (left_stats, right_stats):
-        _draw_panel(draw, panel, fill=black, outline=gold, width=3)
+    font1 = _fit_font(draw, name1, 345, 34, 18)
+    font2 = _fit_font(draw, name2, 345, 34, 18)
 
-    def draw_stat_row(panel, fighter):
-        x1, y1, x2, y2 = panel
-        widths = [0.23, 0.18, 0.36, 0.23]
-        labels = ["RECORD", "RP", "PROGRESSION", "DIVISION RANK"]
-        values = [
-            f"{fighter['wins']}-{fighter['losses']}",
-            str(fighter["rp"]),
-            str(fighter["progression_rank"] or "--").upper(),
-            f"#{fighter['division_rank']}" if fighter["division_rank"] else "--",
+    _draw_centered(draw, left_name_box, name1, font1, fill=white, stroke=2)
+    _draw_centered(draw, right_name_box, name2, font2, fill=white, stroke=2)
+
+    # -----------------------------------------------------
+    # Fighter information values
+    # Template already has GYM / RECORD / RP / RANK labels.
+    # Cover only the value area to keep the baked labels intact.
+    # -----------------------------------------------------
+    def draw_fighter_info(x1, x2, fighter):
+        rows = [
+            ("gym_name", 655, 693),
+            ("record", 694, 732),
+            ("rp", 733, 771),
+            ("rank", 772, 811),
         ]
-        px = x1 + 8
-        usable = (x2 - x1) - 16
-        for i, (frac, label, value) in enumerate(zip(widths, labels, values)):
-            cw = int(usable * frac)
-            cell = (px, y1 + 6, px + cw, y2 - 6)
-            if i:
-                draw.line((px, y1 + 12, px, y2 - 12), fill=(115, 91, 40), width=1)
-            label_font = _fit_font(draw, label, cw - 8, 16, 11)
-            value_font = _fit_font(draw, value, cw - 8, 27, 16)
-            _draw_centered(draw, (cell[0]+2, y1+10, cell[2]-2, y1+43), label, label_font, fill=gold, stroke=1)
-            _draw_centered(draw, (cell[0]+2, y1+45, cell[2]-2, y2-8), value, value_font, fill=white, stroke=1)
-            px += cw
 
-    draw_stat_row(left_stats, fighter1)
-    draw_stat_row(right_stats, fighter2)
+        values = {
+            "gym_name": str(fighter.get("gym_name") or "INDEPENDENT").upper(),
+            "record": f"{fighter['wins']}-{fighter['losses']}",
+            "rp": str(fighter["rp"]),
+            "rank": (
+                f"{str(fighter['progression_rank'] or 'PROSPECT').upper()}"
+                + (
+                    f" • #{fighter['division_rank']}"
+                    if fighter.get("division_rank")
+                    else ""
+                )
+            ),
+        }
 
-    # Completely cover and redraw the division/bout panel.
-    division_panel = (279, 1091, 843, 1182)
-    _draw_panel(draw, division_panel, fill=black, outline=gold, width=4)
-    division_text = f"{division.upper()} DIVISION"
-    division_font = _fit_font(draw, division_text, 520, 40, 25)
-    _draw_centered(draw, (297, 1098, 825, 1144), division_text, division_font, fill=gold, stroke=2)
+        # Left side label occupies about the first 100px of the panel.
+        value_x1 = x1 + 115
+        value_x2 = x2 - 10
 
-    bout_text = "CHAMPIONSHIP BOUT" if booking["bout_type"] == "championship" else "REGULAR BOUT"
-    bout_font = _fit_font(draw, bout_text, 390, 24, 16)
-    _draw_centered(draw, (360, 1143, 762, 1175), bout_text, bout_font, fill=white, stroke=1)
+        for key, y1, y2 in rows:
+            _cover_value_area(draw, (value_x1, y1, value_x2, y2), fill=black)
+            value = values[key]
+            font = _fit_font(draw, value, value_x2 - value_x1 - 8, 23, 13)
+            _draw_centered(
+                draw,
+                (value_x1 + 3, y1 + 2, value_x2 - 3, y2 - 2),
+                value,
+                font,
+                fill=white,
+                stroke=1,
+            )
 
-    # Booking ID remains small for commissioner audit/troubleshooting.
-    booking_text = f"BOOKING #{booking['id']}"
-    booking_font = _load_osbl_font(18, bold=True)
-    draw.text((18, 1365), booking_text, font=booking_font, fill=gold, stroke_width=1, stroke_fill=(0, 0, 0))
+    draw_fighter_info(58, 426, fighter1)
+    draw_fighter_info(1110, 1478, fighter2)
+
+    # -----------------------------------------------------
+    # Center fight information
+    # -----------------------------------------------------
+    division_text = str(booking["division"]).upper()
+    fight_type_text = (
+        "CHAMPIONSHIP FIGHT"
+        if str(booking["bout_type"]).casefold() == "championship"
+        else "REGULAR FIGHT"
+    )
+    booking_text = str(booking["id"])
+    session_id = booking["fight_night_session_id"]
+    session_text = str(session_id) if session_id else "—"
+
+    center_fields = [
+        ((486, 612, 1050, 666), division_text, 31),
+        ((486, 694, 1050, 748), fight_type_text, 29),
+        ((488, 778, 742, 835), booking_text, 30),
+        ((794, 778, 1048, 835), session_text, 30),
+    ]
+
+    for box, value, size in center_fields:
+        _cover_value_area(
+            draw,
+            (box[0] + 5, box[1] + 7, box[2] - 5, box[3] - 5),
+            fill=black,
+        )
+        font = _fit_font(draw, value, box[2] - box[0] - 25, size, 16)
+        _draw_centered(draw, box, value, font, fill=white, stroke=1)
+
+    # -----------------------------------------------------
+    # Fight Night status + portrait lock status
+    # Keep this inside the poster so Discord needs no extra info block.
+    # -----------------------------------------------------
+    status = str(booking["status"] or "").casefold()
+    if session_id:
+        fightnight_status = "ACTIVE FIGHT NIGHT"
+    else:
+        fightnight_status = "MATCHUP BOOKED"
+
+    portrait_status = "BOTH FIGHTER PORTRAITS LOCKED"
+
+    status_box = (500, 860, 1036, 905)
+    _draw_panel(draw, status_box, fill=black, outline=gold, width=3)
+    status_font = _fit_font(draw, fightnight_status, 485, 27, 16)
+    _draw_centered(
+        draw,
+        status_box,
+        fightnight_status,
+        status_font,
+        fill=(green if session_id else gold),
+        stroke=1,
+    )
+
+    lock_box = (560, 913, 976, 949)
+    _draw_panel(draw, lock_box, fill=black, outline=gold, width=2)
+    lock_font = _fit_font(draw, portrait_status, 375, 18, 11)
+    _draw_centered(
+        draw,
+        lock_box,
+        portrait_status,
+        lock_font,
+        fill=white,
+        stroke=1,
+    )
 
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
@@ -1184,10 +1267,12 @@ async def _send_locked_fight_poster(ctx, booking_id):
                    f1.rp AS f1_rp, f1.progression_rank AS f1_progression,
                    f1.division_rank AS f1_division_rank, f1.champion AS f1_champion,
                    f1.title_defenses AS f1_title_defenses, f1.photo_data AS f1_photo,
+                   f1.gym AS f1_gym,
                    f2.fighter_name AS f2_name, f2.wins AS f2_wins, f2.losses AS f2_losses,
                    f2.rp AS f2_rp, f2.progression_rank AS f2_progression,
                    f2.division_rank AS f2_division_rank, f2.champion AS f2_champion,
-                   f2.title_defenses AS f2_title_defenses, f2.photo_data AS f2_photo
+                   f2.title_defenses AS f2_title_defenses, f2.photo_data AS f2_photo,
+                   f2.gym AS f2_gym
             FROM fight_bookings b
             JOIN fighters f1 ON f1.fighter_key = b.fighter1_key
             JOIN fighters f2 ON f2.fighter_key = b.fighter2_key
@@ -1211,12 +1296,14 @@ async def _send_locked_fight_poster(ctx, booking_id):
         "rp": row["f1_rp"], "progression_rank": row["f1_progression"],
         "division_rank": row["f1_division_rank"], "champion": row["f1_champion"],
         "title_defenses": row["f1_title_defenses"], "photo_data": row["f1_photo"],
+        "gym_name": row["f1_gym"],
     }
     fighter2 = {
         "fighter_name": row["f2_name"], "wins": row["f2_wins"], "losses": row["f2_losses"],
         "rp": row["f2_rp"], "progression_rank": row["f2_progression"],
         "division_rank": row["f2_division_rank"], "champion": row["f2_champion"],
         "title_defenses": row["f2_title_defenses"], "photo_data": row["f2_photo"],
+        "gym_name": row["f2_gym"],
     }
 
     try:
@@ -1231,20 +1318,30 @@ async def _send_locked_fight_poster(ctx, booking_id):
 
     filename = f"osbl_booking_{booking_id}_{row['division'].casefold()}_fight_card.png"
     poster_file = discord.File(poster, filename=filename)
-    embed = discord.Embed(
-        title="🥊 OSBL OFFICIAL FIGHT CARD",
-        description=(
-            f"**{row['fighter1_name']} vs {row['fighter2_name']}**\n"
-            f"{row['division']} • {row['bout_type'].title()} • Booking #{booking_id}\n"
-            "🔒 **OFFICIAL MATCHUP LOCKED**\n"
-            f"🎨 Renderer: **{POSTER_RENDERER_VERSION}**"
-        ),
-        color=discord.Color.gold(),
-    )
-    embed.set_image(url=f"attachment://{filename}")
-    embed.set_footer(text="ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
-    await ctx.send(embed=embed, file=poster_file)
+    # All public matchup information is rendered inside the image.
+    # Discord posts only the finished OSBL poster — no duplicate embed/text.
+    await ctx.send(file=poster_file)
     return True
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightcardposter(ctx, booking_id: int = None):
+    """Generate the premium OSBL visual fight card for one booking."""
+    if booking_id is None:
+        await ctx.send("❌ Use `!fightcardposter <Booking ID>`")
+        return
+    await _send_locked_fight_poster(ctx, booking_id)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def rerenderfightcard(ctx, booking_id: int = None):
+    """Rebuild a booking poster from the latest saved fighter portraits and live data."""
+    if booking_id is None:
+        await ctx.send("❌ Use `!rerenderfightcard <Booking ID>`")
+        return
+    await _send_locked_fight_poster(ctx, booking_id)
 
 
 @bot.command()
@@ -1631,18 +1728,17 @@ async def cancelbookedfight(ctx, booking_id: int = None):
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def fightcard(ctx):
+    """
+    Post the current OSBL Fight Card as finished visual poster(s) only.
+    No duplicate matchup text or separate portrait stack is sent.
+    """
     async with bot.db.acquire() as conn:
-        active_session = await conn.fetchval(
-            "SELECT id FROM fight_night_sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1"
-        )
         rows = await conn.fetch(
             """
             SELECT
-                b.*,
+                b.id,
                 f1.photo_data AS fighter1_photo_data,
-                f1.photo_filename AS fighter1_photo_filename,
-                f2.photo_data AS fighter2_photo_data,
-                f2.photo_filename AS fighter2_photo_filename
+                f2.photo_data AS fighter2_photo_data
             FROM fight_bookings b
             LEFT JOIN fighters f1 ON f1.fighter_key = b.fighter1_key
             LEFT JOIN fighters f2 ON f2.fighter_key = b.fighter2_key
@@ -1653,76 +1749,16 @@ async def fightcard(ctx):
         )
 
     if not rows:
-        await ctx.send("📋 **OSBL FIGHT CARD**\nNo active booked matchups.")
+        await ctx.send("📋 **OSBL FIGHT CARD** — No active booked matchups.")
         return
 
-    lines = []
     for row in rows:
-        status_icon = "🔒" if row["status"] == "locked" else "🟡"
-        session_text = (
-            f"Session {row['fight_night_session_id']}"
-            if row["fight_night_session_id"]
-            else "Unassigned"
-        )
-        photo_icon = "📸" if row["fighter1_photo_data"] and row["fighter2_photo_data"] else "🖼️"
-        lines.append(
-            f"**#{row['id']}** {status_icon} **{row['fighter1_name']} vs {row['fighter2_name']}** {photo_icon}\n"
-            f"{row['division']} • {row['bout_type'].title()} • {session_text}"
-        )
-
-    embed = discord.Embed(
-        title="🥊 OSBL OFFICIAL FIGHT CARD",
-        description="\n\n".join(lines),
-        color=discord.Color.gold(),
-    )
-    if active_session:
-        embed.add_field(
-            name="🟢 Active Fight Night",
-            value=f"Session **{active_session}**",
-            inline=False,
-        )
-    embed.set_footer(text="🟡 Booked • 🔒 Locked • 📸 Both fighter portraits locked")
-    await ctx.send(embed=embed)
-
-    # Send locked fighter portraits for each matchup. Images are stored in PostgreSQL,
-    # so they survive Railway redeploys and do not depend on temporary Discord URLs.
-    for row in rows:
-        portrait_embeds = []
-        files = []
-
-        def safe_ext(filename):
-            filename = filename or "fighter.png"
-            ext = os.path.splitext(filename)[1].lower()
-            return ext if ext in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
-
-        if row["fighter1_photo_data"]:
-            filename1 = f"booking_{row['id']}_fighter1{safe_ext(row['fighter1_photo_filename'])}"
-            files.append(discord.File(io.BytesIO(bytes(row["fighter1_photo_data"])), filename=filename1))
-            e1 = discord.Embed(
-                title=f"🥊 {row['fighter1_name']}",
-                description=f"Booking #{row['id']} • {row['division']} • {row['bout_type'].title()}",
-                color=discord.Color.gold(),
-            )
-            e1.set_image(url=f"attachment://{filename1}")
-            portrait_embeds.append(e1)
-
-        if row["fighter2_photo_data"]:
-            filename2 = f"booking_{row['id']}_fighter2{safe_ext(row['fighter2_photo_filename'])}"
-            files.append(discord.File(io.BytesIO(bytes(row["fighter2_photo_data"])), filename=filename2))
-            e2 = discord.Embed(
-                title=f"🥊 {row['fighter2_name']}",
-                description=f"Booking #{row['id']} • {row['division']} • {row['bout_type'].title()}",
-                color=discord.Color.gold(),
-            )
-            e2.set_image(url=f"attachment://{filename2}")
-            portrait_embeds.append(e2)
-
-        if portrait_embeds:
+        if not row["fighter1_photo_data"] or not row["fighter2_photo_data"]:
             await ctx.send(
-                content=f"📸 **OFFICIAL MATCHUP PORTRAITS — Booking #{row['id']}**",
-                embeds=portrait_embeds,
-                files=files,
+                f"🖼️ Booking #{row['id']} needs both fighter portraits locked before its poster can be generated."
             )
+            continue
+        await _send_locked_fight_poster(ctx, row["id"])
 
 
 # =========================================================
@@ -2877,7 +2913,7 @@ async def setfighterphoto(ctx, *, fighter_name: str = None):
     embed.add_field(name="Locked By", value=ctx.author.display_name, inline=False)
     embed.add_field(
         name="Fight Card",
-        value="This portrait will automatically appear when the fighter is on `!fightcard`.",
+        value="This portrait is used automatically by `!fightcard`, `!fightcardposter`, and locked-matchup poster generation.",
         inline=False,
     )
     embed.set_image(url=f"attachment://{preview_name}")
