@@ -558,7 +558,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V8-FINAL-CLEAN-FIGHT-CARDS-2026-09-09"
+POSTER_RENDERER_VERSION = "V9-CLEAN-BOOKING-SESSION-2026-09-09"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
@@ -1199,14 +1199,13 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
     session_id = booking["fight_night_session_id"]
     session_text = str(session_id) if session_id else "—"
 
-    center_fields = [
+    # Division and Fight Type still use the template's framed value panels.
+    framed_fields = [
         ((486, 612, 1050, 666), division_text, 31),
         ((486, 694, 1050, 748), fight_type_text, 29),
-        ((488, 778, 742, 835), booking_text, 30),
-        ((794, 778, 1048, 835), session_text, 30),
     ]
 
-    for box, value, size in center_fields:
+    for box, value, size in framed_fields:
         _cover_value_area(
             draw,
             (box[0] + 5, box[1] + 7, box[2] - 5, box[3] - 5),
@@ -1214,6 +1213,31 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
         )
         font = _fit_font(draw, value, box[2] - box[0] - 25, size, 16)
         _draw_centered(draw, box, value, font, fill=white, stroke=1)
+
+    # Booking # and Session # are intentionally clean text only.
+    # The V9 template has no extra boxes under these labels.
+    booking_box = (500, 786, 744, 824)
+    session_box = (792, 786, 1036, 824)
+
+    booking_font = _fit_font(draw, booking_text, 210, 29, 16)
+    session_font = _fit_font(draw, session_text, 210, 29, 16)
+
+    _draw_centered(
+        draw,
+        booking_box,
+        booking_text,
+        booking_font,
+        fill=white,
+        stroke=2,
+    )
+    _draw_centered(
+        draw,
+        session_box,
+        session_text,
+        session_font,
+        fill=white,
+        stroke=2,
+    )
 
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
