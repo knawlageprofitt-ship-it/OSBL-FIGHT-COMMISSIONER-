@@ -153,6 +153,26 @@ class OSBLBot(commands.Bot):
             """)
 
             await conn.execute("""
+                CREATE TABLE IF NOT EXISTS fight_night_staff_assignments (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id BIGINT NOT NULL REFERENCES fight_night_sessions(id) ON DELETE CASCADE,
+                    job_key TEXT NOT NULL,
+                    job_name TEXT NOT NULL,
+                    staff_user_id BIGINT NOT NULL,
+                    staff_display_name TEXT NOT NULL,
+                    assigned_by_id BIGINT NOT NULL,
+                    assigned_by_name TEXT NOT NULL,
+                    assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (session_id, job_key)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS fight_night_staff_session_idx
+                ON fight_night_staff_assignments (session_id, job_key);
+            """)
+
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS fight_night_financial_snapshots (
                     session_id BIGINT PRIMARY KEY REFERENCES fight_night_sessions(id) ON DELETE CASCADE,
                     official_fights INTEGER NOT NULL DEFAULT 0,
@@ -569,6 +589,7 @@ GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
 FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
 FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
+FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -592,6 +613,7 @@ async def systemcheck(ctx):
         "result_override_log",
         "fight_night_sessions",
         "fight_night_financial_snapshots",
+        "fight_night_staff_assignments",
         "fight_bookings",
         "gym_settings",
         "gym_management_log",
@@ -685,6 +707,10 @@ async def systemcheck(ctx):
         "fighthistory",
         "startfightnight",
         "fightnightstatus",
+        "staffjobs",
+        "assignstaff",
+        "unassignstaff",
+        "fightnightstaff",
         "fightnightrecap",
         "fightnightfinance",
         "testfightnightlist",
@@ -860,6 +886,12 @@ async def systemcheck(ctx):
         value=f"**{FIGHT_NIGHT_FINANCE_VERSION}**",
         inline=False,
     )
+    embed.add_field(
+        name="👥 Fight Night Staff",
+        value=FIGHT_NIGHT_STAFF_VERSION,
+        inline=False,
+    )
+
     embed.add_field(
         name="🧹 Fight Night Cleanup",
         value=f"**{FIGHT_NIGHT_CLEANUP_VERSION}**",
@@ -1748,6 +1780,362 @@ async def fightcard(ctx):
         await _send_locked_fight_poster(ctx, row["id"])
 
 
+
+# =========================================================
+# FIGHT NIGHT STAFF ASSIGNMENT SYSTEM
+# Session-scoped staff jobs. Assignments are preserved with the
+# Fight Night session and automatically disappear if a TEST
+# Fight Night session is deleted through the cleanup system.
+# =========================================================
+
+OSBL_FIGHT_NIGHT_JOBS = {
+    "supervisor": {
+        "name": "Fight Night Supervisor",
+        "emoji": "🎧",
+        "description": "Runs the event, oversees staff, handles disputes, and closes Fight Night.",
+    },
+    "matchmaker": {
+        "name": "Matchmaker / Fight Card Official",
+        "emoji": "🥊",
+        "description": "Books fights, locks matchups, confirms divisions/bout type, and prepares the fight card.",
+    },
+    "checkin": {
+        "name": "Fighter Check-In Official",
+        "emoji": "✅",
+        "description": "Verifies fighters are present and ready before their bout.",
+    },
+    "results": {
+        "name": "Results & Rankings Official",
+        "emoji": "📊",
+        "description": "Records official results and verifies record, RP, ranking, and progression updates.",
+    },
+    "payout": {
+        "name": "Payout / Treasury Official",
+        "emoji": "💰",
+        "description": "Handles payout requests, completed cashouts, fighter banks, and treasury checks.",
+    },
+    "media": {
+        "name": "Media / Fight Card Official",
+        "emoji": "🎨",
+        "description": "Generates and posts fight-card posters and other public Fight Night graphics.",
+    },
+}
+
+OSBL_FIGHT_NIGHT_JOB_ALIASES = {
+    "supervisor": "supervisor",
+    "sup": "supervisor",
+    "manager": "supervisor",
+    "matchmaker": "matchmaker",
+    "match": "matchmaker",
+    "card": "matchmaker",
+    "fightcard": "matchmaker",
+    "checkin": "checkin",
+    "check-in": "checkin",
+    "check": "checkin",
+    "results": "results",
+    "result": "results",
+    "rankings": "results",
+    "ranking": "results",
+    "payout": "payout",
+    "treasury": "payout",
+    "bank": "payout",
+    "media": "media",
+    "poster": "media",
+    "graphics": "media",
+}
+
+def _normalize_fight_night_job(raw_job):
+    key = re.sub(r"\s+", "", str(raw_job or "").strip().casefold())
+    return OSBL_FIGHT_NIGHT_JOB_ALIASES.get(key)
+
+async def _active_fight_night_session(conn):
+    return await conn.fetchrow(
+        """
+        SELECT id, status, started_by_name, started_at, is_test
+        FROM fight_night_sessions
+        WHERE status = 'active'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+
+async def _resolve_staff_member(ctx, raw_member):
+    raw_member = str(raw_member or "").strip()
+    if not raw_member:
+        return None
+
+    converter = commands.MemberConverter()
+    try:
+        return await converter.convert(ctx, raw_member)
+    except commands.MemberNotFound:
+        # Friendly fallback for exact display-name / username matches.
+        target = raw_member.casefold().lstrip("@")
+        for member in ctx.guild.members:
+            if member.display_name.casefold() == target or member.name.casefold() == target:
+                return member
+    return None
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def staffjobs(ctx):
+    """Show the official Fight Night jobs available for assignment."""
+    lines = []
+    for job_key, job in OSBL_FIGHT_NIGHT_JOBS.items():
+        lines.append(
+            f"{job['emoji']} **{job['name']}** (`{job_key}`)\n"
+            f"{job['description']}"
+        )
+
+    embed = discord.Embed(
+        title="👥 OSBL FIGHT NIGHT STAFF JOBS",
+        description="\n\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Assignment Command",
+        value="`!assignstaff job | @member`\nExample: `!assignstaff results | @Official`",
+        inline=False,
+    )
+    embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def assignstaff(ctx, *, details: str = None):
+    """
+    Assign one staff member to one job for the active Fight Night.
+    Usage: !assignstaff results | @Member
+    """
+    if not details:
+        await ctx.send(
+            "❌ Use `!assignstaff job | @member`\n"
+            "Example: `!assignstaff results | @Official`\n"
+            "Use `!staffjobs` to see the available jobs."
+        )
+        return
+
+    if "|" in details:
+        raw_job, raw_member = [part.strip() for part in details.split("|", 1)]
+    else:
+        pieces = details.strip().split(maxsplit=1)
+        if len(pieces) != 2:
+            await ctx.send(
+                "❌ Use `!assignstaff job | @member`\n"
+                "Example: `!assignstaff payout | @Official`"
+            )
+            return
+        raw_job, raw_member = pieces
+
+    job_key = _normalize_fight_night_job(raw_job)
+    if not job_key:
+        await ctx.send(
+            f"❌ Unknown Fight Night job: **{raw_job}**\n"
+            "Use `!staffjobs` to see the official job keys."
+        )
+        return
+
+    member = await _resolve_staff_member(ctx, raw_member)
+    if member is None:
+        await ctx.send(
+            f"❌ I couldn't find **{raw_member}** in this Discord server.\n"
+            "Mention the member directly, for example: `!assignstaff results | @Official`"
+        )
+        return
+
+    async with bot.db.acquire() as conn:
+        session = await _active_fight_night_session(conn)
+        if not session:
+            await ctx.send(
+                "❌ There is no active Fight Night.\n"
+                "Start one first with `!startfightnight` or `!startfightnight test`."
+            )
+            return
+
+        job = OSBL_FIGHT_NIGHT_JOBS[job_key]
+        previous = await conn.fetchrow(
+            """
+            SELECT staff_display_name
+            FROM fight_night_staff_assignments
+            WHERE session_id = $1 AND job_key = $2
+            """,
+            session["id"],
+            job_key,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO fight_night_staff_assignments (
+                session_id,
+                job_key,
+                job_name,
+                staff_user_id,
+                staff_display_name,
+                assigned_by_id,
+                assigned_by_name
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (session_id, job_key)
+            DO UPDATE SET
+                job_name = EXCLUDED.job_name,
+                staff_user_id = EXCLUDED.staff_user_id,
+                staff_display_name = EXCLUDED.staff_display_name,
+                assigned_by_id = EXCLUDED.assigned_by_id,
+                assigned_by_name = EXCLUDED.assigned_by_name,
+                assigned_at = NOW()
+            """,
+            session["id"],
+            job_key,
+            job["name"],
+            member.id,
+            member.display_name,
+            ctx.author.id,
+            ctx.author.display_name,
+        )
+
+    embed = discord.Embed(
+        title="✅ OSBL FIGHT NIGHT JOB ASSIGNED",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Session", value=f"**#{session['id']}**", inline=True)
+    embed.add_field(
+        name="Job",
+        value=f"{job['emoji']} **{job['name']}**",
+        inline=True,
+    )
+    embed.add_field(name="Assigned To", value=member.mention, inline=False)
+    if previous and previous["staff_display_name"] != member.display_name:
+        embed.add_field(
+            name="Replaced",
+            value=previous["staff_display_name"],
+            inline=False,
+        )
+    embed.add_field(
+        name="Assigned By",
+        value=ctx.author.mention,
+        inline=False,
+    )
+    embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def unassignstaff(ctx, *, job: str = None):
+    """Remove one job assignment from the active Fight Night."""
+    job_key = _normalize_fight_night_job(job)
+    if not job_key:
+        await ctx.send(
+            "❌ Use `!unassignstaff <job>`\n"
+            "Example: `!unassignstaff media`\n"
+            "Use `!staffjobs` to see the job keys."
+        )
+        return
+
+    async with bot.db.acquire() as conn:
+        session = await _active_fight_night_session(conn)
+        if not session:
+            await ctx.send("❌ There is no active Fight Night.")
+            return
+
+        removed = await conn.fetchrow(
+            """
+            DELETE FROM fight_night_staff_assignments
+            WHERE session_id = $1 AND job_key = $2
+            RETURNING staff_display_name
+            """,
+            session["id"],
+            job_key,
+        )
+
+    if not removed:
+        await ctx.send(
+            f"ℹ️ **{OSBL_FIGHT_NIGHT_JOBS[job_key]['name']}** is not currently assigned for Session #{session['id']}."
+        )
+        return
+
+    await ctx.send(
+        f"✅ **{OSBL_FIGHT_NIGHT_JOBS[job_key]['name']}** has been unassigned from "
+        f"**{removed['staff_display_name']}** for Session **#{session['id']}**."
+    )
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def fightnightstaff(ctx, session_id: int = None):
+    """
+    Show staff assignments for the active Fight Night or a specific session.
+    """
+    async with bot.db.acquire() as conn:
+        if session_id is None:
+            session = await _active_fight_night_session(conn)
+            if not session:
+                session = await conn.fetchrow(
+                    """
+                    SELECT id, status, started_by_name, started_at, is_test
+                    FROM fight_night_sessions
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                )
+        else:
+            session = await conn.fetchrow(
+                """
+                SELECT id, status, started_by_name, started_at, is_test
+                FROM fight_night_sessions
+                WHERE id = $1
+                """,
+                session_id,
+            )
+
+        if not session:
+            await ctx.send("❌ No Fight Night session was found.")
+            return
+
+        rows = await conn.fetch(
+            """
+            SELECT job_key, job_name, staff_user_id, staff_display_name, assigned_by_name, assigned_at
+            FROM fight_night_staff_assignments
+            WHERE session_id = $1
+            ORDER BY id ASC
+            """,
+            session["id"],
+        )
+
+    assignments = {row["job_key"]: row for row in rows}
+    lines = []
+    for job_key, job in OSBL_FIGHT_NIGHT_JOBS.items():
+        row = assignments.get(job_key)
+        if row:
+            lines.append(
+                f"{job['emoji']} **{job['name']}** — <@{row['staff_user_id']}>"
+            )
+        else:
+            lines.append(
+                f"{job['emoji']} **{job['name']}** — *Unassigned*"
+            )
+
+    status = str(session["status"]).upper()
+    session_type = "🧪 TEST" if session["is_test"] else "🏆 OFFICIAL"
+    embed = discord.Embed(
+        title=f"👥 OSBL FIGHT NIGHT STAFF — SESSION #{session['id']}",
+        description=(
+            f"**Status:** {status}\n"
+            f"**Session Type:** {session_type}\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Commissioner Controls",
+        value=(
+            "`!assignstaff job | @member`\n"
+            "`!unassignstaff job`\n"
+            "`!staffjobs`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
+    await ctx.send(embed=embed)
+
+
 # =========================================================
 # FIGHT NIGHT SESSION SYSTEM
 # Creates a clean event boundary without blocking normal results.
@@ -1913,6 +2301,25 @@ async def fightnightstatus(ctx):
         inline=False,
     )
     embed.set_footer(text="Live read-only Fight Night session status")
+    async with bot.db.acquire() as conn:
+        assigned_staff_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM fight_night_staff_assignments
+            WHERE session_id = $1
+            """,
+            session["id"],
+        )
+
+    embed.add_field(
+        name="👥 Staff Assignments",
+        value=(
+            f"**{assigned_staff_count}/6** jobs assigned\n"
+            "Use `!fightnightstaff` to view the roster."
+        ),
+        inline=False,
+    )
+
     await ctx.send(embed=embed)
 
 
