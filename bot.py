@@ -558,7 +558,7 @@ async def osbl(ctx):
     await ctx.send(embed=embed)
 
 
-POSTER_RENDERER_VERSION = "V7-CLEAN-TEMPLATE-FIGHT-CARDS-2026-09-09"
+POSTER_RENDERER_VERSION = "V8-FINAL-CLEAN-FIGHT-CARDS-2026-09-09"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
 GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
@@ -1107,7 +1107,6 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
     gold = (232, 188, 80)
     white = (252, 252, 252)
     black = (5, 5, 5)
-    green = (75, 235, 115)
 
     # -----------------------------------------------------
     # Fighter portrait windows
@@ -1215,42 +1214,6 @@ def _render_osbl_fight_poster(booking, fighter1, fighter2):
         )
         font = _fit_font(draw, value, box[2] - box[0] - 25, size, 16)
         _draw_centered(draw, box, value, font, fill=white, stroke=1)
-
-    # -----------------------------------------------------
-    # Fight Night status + portrait lock status
-    # Keep this inside the poster so Discord needs no extra info block.
-    # -----------------------------------------------------
-    status = str(booking["status"] or "").casefold()
-    if session_id:
-        fightnight_status = "ACTIVE FIGHT NIGHT"
-    else:
-        fightnight_status = "MATCHUP BOOKED"
-
-    portrait_status = "BOTH FIGHTER PORTRAITS LOCKED"
-
-    status_box = (500, 860, 1036, 905)
-    _draw_panel(draw, status_box, fill=black, outline=gold, width=3)
-    status_font = _fit_font(draw, fightnight_status, 485, 27, 16)
-    _draw_centered(
-        draw,
-        status_box,
-        fightnight_status,
-        status_font,
-        fill=(green if session_id else gold),
-        stroke=1,
-    )
-
-    lock_box = (560, 913, 976, 949)
-    _draw_panel(draw, lock_box, fill=black, outline=gold, width=2)
-    lock_font = _fit_font(draw, portrait_status, 375, 18, 11)
-    _draw_centered(
-        draw,
-        lock_box,
-        portrait_status,
-        lock_font,
-        fill=white,
-        stroke=1,
-    )
 
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
