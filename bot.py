@@ -592,6 +592,7 @@ FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
 FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
 JOB_PERMISSION_ENFORCEMENT_VERSION = "V2-JOB-PERMISSION-FIX-2026-09-10"
+STAFF_NAME_ASSIGNMENT_VERSION = "V1-DISPLAY-NAME-STAFF-ASSIGNMENT-2026-09-10"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -904,6 +905,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🔐 Job Permission Enforcement",
         value=JOB_PERMISSION_ENFORCEMENT_VERSION,
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🪪 Staff Assignment Names",
+        value=STAFF_NAME_ASSIGNMENT_VERSION,
         inline=False,
     )
 
@@ -1953,20 +1960,53 @@ async def _active_fight_night_session(conn):
     )
 
 async def _resolve_staff_member(ctx, raw_member):
+    """
+    Resolve staff primarily by Discord display name.
+    Mentions and usernames remain supported as fallbacks.
+    If multiple members share the same display name, refuse to guess.
+    """
     raw_member = str(raw_member or "").strip()
     if not raw_member:
-        return None
+        return None, "missing"
 
+    # 1) Exact display-name match first.
+    display_target = raw_member.casefold()
+    display_matches = [
+        member
+        for member in ctx.guild.members
+        if member.display_name.casefold() == display_target
+    ]
+
+    if len(display_matches) == 1:
+        return display_matches[0], None
+
+    if len(display_matches) > 1:
+        return None, "ambiguous"
+
+    # 2) Discord mention / member converter fallback.
     converter = commands.MemberConverter()
     try:
-        return await converter.convert(ctx, raw_member)
+        member = await converter.convert(ctx, raw_member)
+        return member, None
     except commands.MemberNotFound:
-        # Friendly fallback for exact display-name / username matches.
-        target = raw_member.casefold().lstrip("@")
-        for member in ctx.guild.members:
-            if member.display_name.casefold() == target or member.name.casefold() == target:
-                return member
-    return None
+        pass
+
+    # 3) Exact username fallback.
+    username_target = raw_member.casefold().lstrip("@")
+    username_matches = [
+        member
+        for member in ctx.guild.members
+        if member.name.casefold() == username_target
+    ]
+
+    if len(username_matches) == 1:
+        return username_matches[0], None
+
+    if len(username_matches) > 1:
+        return None, "ambiguous"
+
+    return None, "not_found"
+
 
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
@@ -1986,7 +2026,7 @@ async def staffjobs(ctx):
     )
     embed.add_field(
         name="Assignment Command",
-        value="`!assignstaff job | @member`\nExample: `!assignstaff results | @Official`",
+        value="`!assignstaff job | Display Name`\nExample: `!assignstaff results | Knawlage Radeem`",
         inline=False,
     )
     embed.add_field(
@@ -2002,12 +2042,12 @@ async def staffjobs(ctx):
 async def assignstaff(ctx, *, details: str = None):
     """
     Assign one staff member to one job for the active Fight Night.
-    Usage: !assignstaff results | @Member
+    Usage: !assignstaff results | Display Name
     """
     if not details:
         await ctx.send(
-            "❌ Use `!assignstaff job | @member`\n"
-            "Example: `!assignstaff results | @Official`\n"
+            "❌ Use `!assignstaff job | Display Name`\n"
+            "Example: `!assignstaff results | Knawlage Radeem`\n"
             "Use `!staffjobs` to see the available jobs."
         )
         return
@@ -2018,8 +2058,8 @@ async def assignstaff(ctx, *, details: str = None):
         pieces = details.strip().split(maxsplit=1)
         if len(pieces) != 2:
             await ctx.send(
-                "❌ Use `!assignstaff job | @member`\n"
-                "Example: `!assignstaff payout | @Official`"
+                "❌ Use `!assignstaff job | Display Name`\n"
+                "Example: `!assignstaff payout | Knawlage Radeem`"
             )
             return
         raw_job, raw_member = pieces
@@ -2032,11 +2072,20 @@ async def assignstaff(ctx, *, details: str = None):
         )
         return
 
-    member = await _resolve_staff_member(ctx, raw_member)
+    member, resolve_error = await _resolve_staff_member(ctx, raw_member)
+
+    if resolve_error == "ambiguous":
+        await ctx.send(
+            f"⚠️ **AMBIGUOUS DISPLAY NAME**\n"
+            f"More than one server member is using **{raw_member}**.\n"
+            "Use that person's exact Discord username or mention them for this assignment."
+        )
+        return
+
     if member is None:
         await ctx.send(
-            f"❌ I couldn't find **{raw_member}** in this Discord server.\n"
-            "Mention the member directly, for example: `!assignstaff results | @Official`"
+            f"❌ I couldn't find a server member with the display name **{raw_member}**.\n"
+            "Use their exact Discord display name. Usernames and mentions still work as fallbacks."
         )
         return
 
@@ -2224,7 +2273,7 @@ async def fightnightstaff(ctx, session_id: int = None):
     embed.add_field(
         name="Commissioner Controls",
         value=(
-            "`!assignstaff job | @member`\n"
+            "`!assignstaff job | Display Name`\n"
             "`!unassignstaff job`\n"
             "`!staffjobs`"
         ),
