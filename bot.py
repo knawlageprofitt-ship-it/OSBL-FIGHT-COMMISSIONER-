@@ -590,6 +590,7 @@ FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
 FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
 FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
+JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -711,6 +712,8 @@ async def systemcheck(ctx):
         "assignstaff",
         "unassignstaff",
         "fightnightstaff",
+        "jobguide",
+        "myjob",
         "fightnightrecap",
         "fightnightfinance",
         "testfightnightlist",
@@ -891,6 +894,12 @@ async def systemcheck(ctx):
         value=FIGHT_NIGHT_STAFF_VERSION,
         inline=False,
     )
+    embed.add_field(
+        name="📘 Staff Command Guides",
+        value=JOB_COMMAND_GUIDE_VERSION,
+        inline=False,
+    )
+
 
     embed.add_field(
         name="🧹 Fight Night Cleanup",
@@ -1896,6 +1905,11 @@ async def staffjobs(ctx):
         value="`!assignstaff job | @member`\nExample: `!assignstaff results | @Official`",
         inline=False,
     )
+    embed.add_field(
+        name="Command Guide",
+        value="`!jobguide <job>`\nExample: `!jobguide results`\nAssigned staff can use `!myjob` during an active Fight Night.",
+        inline=False,
+    )
     embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
     await ctx.send(embed=embed)
 
@@ -2134,6 +2148,348 @@ async def fightnightstaff(ctx, session_id: int = None):
     )
     embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
     await ctx.send(embed=embed)
+
+
+# =========================================================
+# OSBL STAFF JOB COMMAND GUIDES
+# Operational guide layer for each Fight Night assignment.
+# These guides define what each job SHOULD handle. Discord
+# role decorators still provide the technical permission
+# boundary until command-by-job enforcement is enabled.
+# =========================================================
+
+OSBL_JOB_COMMAND_GUIDES = {
+    "supervisor": {
+        "title": "Fight Night Supervisor",
+        "emoji": "🎧",
+        "mission": (
+            "Oversee the entire Fight Night, keep every station moving, resolve "
+            "operational issues, and escalate Commissioner-only decisions."
+        ),
+        "responsibilities": [
+            "Confirm the Fight Night is organized and staffed before bouts begin.",
+            "Monitor the active session, fight card, results flow, and financial closeout.",
+            "Handle disputes and direct staff to the correct station.",
+            "Verify the event is complete before the Commissioner closes the session.",
+        ],
+        "commands": [
+            "!fightnightstatus",
+            "!fightnightstaff",
+            "!fightcard",
+            "!fightnightfinance",
+            "!fightnightrecap",
+            "!fightnightlist",
+            "!systemcheck",
+        ],
+        "restrictions": [
+            "Do not enter or alter fight results unless also assigned Results & Rankings.",
+            "Do not process payouts unless also assigned Payout / Treasury.",
+            "Do not book or lock fights unless also assigned Matchmaker.",
+            "Starting/ending Fight Night and emergency overrides remain Commissioner-only controls.",
+        ],
+        "escalate": "OSBL Commissioner",
+    },
+    "matchmaker": {
+        "title": "Matchmaker / Fight Card Official",
+        "emoji": "🥊",
+        "mission": (
+            "Build a legal, accurate Fight Night card and make sure every matchup "
+            "is correctly booked, locked, and presented."
+        ),
+        "responsibilities": [
+            "Check matchup eligibility before booking.",
+            "Confirm division and regular/championship bout type.",
+            "Book approved fights and lock finalized matchups.",
+            "Generate or refresh the official visual fight card poster.",
+        ],
+        "commands": [
+            "!matchupcheck Fighter One | Fighter Two",
+            "!fightcard",
+            "!fightcardposter <Booking ID>",
+            "!rerenderfightcard <Booking ID>",
+            "!fightposter <Booking ID>",
+        ],
+        "commissioner_commands": [
+            "!bookfight Fighter One | Fighter Two",
+            "!bookfight Fighter One | Fighter Two | championship",
+            "!lockfight <Booking ID>",
+            "!cancelbookedfight <Booking ID>",
+        ],
+        "restrictions": [
+            "Do not enter fight results or change RP/rankings.",
+            "Do not approve, reject, or complete payouts.",
+            "Do not undo results or use Commissioner overrides.",
+            "Do not merge/delete fighters or run cleanup/database administration.",
+        ],
+        "escalate": "Fight Night Supervisor / OSBL Commissioner",
+    },
+    "checkin": {
+        "title": "Fighter Check-In Official",
+        "emoji": "✅",
+        "mission": (
+            "Verify the correct fighters are present, identified, and ready before "
+            "they are cleared to enter the ring."
+        ),
+        "responsibilities": [
+            "Confirm both scheduled fighters are present.",
+            "Verify fighter identity, division, gym, and profile information.",
+            "Confirm the matchup on the official Fight Night card.",
+            "Report no-shows, identity issues, or rule concerns to the Supervisor.",
+        ],
+        "commands": [
+            "!fighter Fighter Name",
+            "!fighterphoto Fighter Name",
+            "!fighters",
+            "!fightcard",
+            "!matchupcheck Fighter One | Fighter Two",
+            "!fightnightstatus",
+        ],
+        "restrictions": [
+            "Do not book, lock, or cancel matchups.",
+            "Do not enter results, set ranks, or change fighter records.",
+            "Do not process payouts or treasury actions.",
+            "Do not close Fight Night or use administrative cleanup commands.",
+        ],
+        "escalate": "Fight Night Supervisor",
+    },
+    "results": {
+        "title": "Results & Rankings Official",
+        "emoji": "📊",
+        "mission": (
+            "Record the official outcome correctly and verify that records, RP, "
+            "rankings, and progression reflect the result."
+        ),
+        "responsibilities": [
+            "Verify winner, loser, and final score before submission.",
+            "Enter regular and championship results using the correct command.",
+            "Check fighter history and rankings after the result posts.",
+            "Report any incorrect or disputed result before another correction is attempted.",
+        ],
+        "commands": [
+            "!result Winner | Loser | Score",
+            "!champresult Winner | Loser | Score",
+            "!rankings <Division>",
+            "!top10 <Division>",
+            "!allrankings",
+            "!fighthistory",
+            "!fighterhistory Fighter Name",
+            "!champions",
+        ],
+        "restrictions": [
+            "Do not use !forcechampresult; it is Commissioner-only.",
+            "Do not use !undoresult or !confirmundo; escalate corrections to the Commissioner.",
+            "Do not book/lock fights unless separately assigned Matchmaker.",
+            "Do not process payouts or change fighter identity/gym data.",
+        ],
+        "escalate": "Fight Night Supervisor / OSBL Commissioner",
+    },
+    "payout": {
+        "title": "Payout / Treasury Official",
+        "emoji": "💰",
+        "mission": (
+            "Track money credited, requested, paid, and still owed while preserving "
+            "a clear OSBL payout audit trail."
+        ),
+        "responsibilities": [
+            "Review pending fighter payout requests.",
+            "Verify the fighter bank before completing or rejecting a request.",
+            "Record actual completed cashouts accurately.",
+            "Monitor league/gym treasury exposure and Fight Night financial totals.",
+        ],
+        "commands": [
+            "!fighterbank Fighter Name",
+            "!payoutrequests",
+            "!payfighter <Request ID>",
+            "!rejectpayout <Request ID>",
+            "!treasury",
+            "!gymtreasury Gym Name",
+            "!treasurytop",
+            "!payoutstatement Fighter Name",
+            "!payoutreport [Session ID]",
+            "!payoutaudit",
+            "!fightnightfinance [Session ID]",
+            "!fightpayout <History ID>",
+            "!fighterpayout Fighter Name",
+            "!payoutdesk",
+        ],
+        "restrictions": [
+            "Never pay a request without verifying the request ID and fighter balance.",
+            "Do not change fight results, rankings, or bookings.",
+            "Do not merge/delete fighters or normalize database data.",
+            "Do not use Commissioner result overrides or undo commands.",
+        ],
+        "escalate": "Fight Night Supervisor / OSBL Commissioner",
+    },
+    "media": {
+        "title": "Media / Fight Card Official",
+        "emoji": "🎨",
+        "mission": (
+            "Publish accurate, professional OSBL Fight Night visuals using the "
+            "official booking data and locked fighter portraits."
+        ),
+        "responsibilities": [
+            "Generate the official Fight Night card/poster.",
+            "Confirm the correct two fighters and portraits appear on every poster.",
+            "Refresh a poster when approved fighter imagery or booking data changes.",
+            "Keep public graphics consistent with the approved OSBL presentation.",
+        ],
+        "commands": [
+            "!fightcard",
+            "!fightcardposter <Booking ID>",
+            "!rerenderfightcard <Booking ID>",
+            "!fightposter <Booking ID>",
+            "!fightposterall",
+            "!fighterphoto Fighter Name",
+        ],
+        "restrictions": [
+            "Do not book, lock, or cancel fights.",
+            "Do not enter results or alter rankings/RP.",
+            "Do not process fighter payouts or treasury actions.",
+            "Do not modify fighter records, merge fighters, or use cleanup/admin commands.",
+        ],
+        "escalate": "Matchmaker / Fight Night Supervisor",
+    },
+}
+
+def _format_job_guide(job_key):
+    guide = OSBL_JOB_COMMAND_GUIDES[job_key]
+    job = OSBL_FIGHT_NIGHT_JOBS[job_key]
+
+    embed = discord.Embed(
+        title=f"{guide['emoji']} OSBL JOB GUIDE — {guide['title'].upper()}",
+        description=f"**Mission**\n{guide['mission']}",
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="📋 Responsibilities",
+        value="\n".join(f"• {item}" for item in guide["responsibilities"]),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⌨️ Commands for This Job",
+        value="\n".join(f"`{cmd}`" for cmd in guide["commands"]),
+        inline=False,
+    )
+
+    if guide.get("commissioner_commands"):
+        embed.add_field(
+            name="🔐 Commissioner-Only Commands Used by This Station",
+            value=(
+                "These are part of this station's workflow, but currently require "
+                "the **OSBL COMMISSIONER** Discord role.\n"
+                + "\n".join(f"`{cmd}`" for cmd in guide["commissioner_commands"])
+            ),
+            inline=False,
+        )
+
+    embed.add_field(
+        name="🚫 Restrictions",
+        value="\n".join(f"• {item}" for item in guide["restrictions"]),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⬆️ Escalate Problems To",
+        value=f"**{guide['escalate']}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="ℹ️ Permission Note",
+        value=(
+            "This guide defines the **OSBL job policy**. Current command access is "
+            "still controlled by existing Discord roles until job-based command "
+            "enforcement is activated."
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"{JOB_COMMAND_GUIDE_VERSION} • Job key: {job_key}"
+    )
+    return embed
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def jobguide(ctx, *, job: str = None):
+    """
+    Show the command guide for one Fight Night staff job.
+    Example: !jobguide results
+    """
+    if not job:
+        lines = []
+        for key, info in OSBL_FIGHT_NIGHT_JOBS.items():
+            lines.append(
+                f"{info['emoji']} **{info['name']}** — `!jobguide {key}`"
+            )
+
+        embed = discord.Embed(
+            title="📘 OSBL FIGHT NIGHT JOB COMMAND GUIDES",
+            description=(
+                "Choose a job below to see its responsibilities, commands, "
+                "restrictions, and escalation path.\n\n"
+                + "\n".join(lines)
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text=JOB_COMMAND_GUIDE_VERSION)
+        await ctx.send(embed=embed)
+        return
+
+    job_key = _normalize_fight_night_job(job)
+    if not job_key or job_key not in OSBL_JOB_COMMAND_GUIDES:
+        await ctx.send(
+            f"❌ Unknown job: **{job}**\nUse `!jobguide` to see the official job keys."
+        )
+        return
+
+    await ctx.send(embed=_format_job_guide(job_key))
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def myjob(ctx):
+    """
+    Show the caller's active Fight Night job assignment and its command guide.
+    """
+    async with bot.db.acquire() as conn:
+        session = await _active_fight_night_session(conn)
+        if not session:
+            await ctx.send(
+                "ℹ️ There is no active Fight Night session, so you do not currently "
+                "have an active Fight Night job assignment."
+            )
+            return
+
+        rows = await conn.fetch(
+            """
+            SELECT job_key, job_name
+            FROM fight_night_staff_assignments
+            WHERE session_id = $1
+              AND staff_user_id = $2
+            ORDER BY id ASC
+            """,
+            session["id"],
+            ctx.author.id,
+        )
+
+    if not rows:
+        await ctx.send(
+            f"ℹ️ {ctx.author.mention}, you are not assigned to a Fight Night job "
+            f"for **Session #{session['id']}**.\n"
+            "Ask the OSBL Commissioner to assign you with `!assignstaff`."
+        )
+        return
+
+    await ctx.send(
+        f"👤 **{ctx.author.display_name} — Fight Night Session #{session['id']}**"
+    )
+
+    for row in rows:
+        job_key = row["job_key"]
+        if job_key in OSBL_JOB_COMMAND_GUIDES:
+            await ctx.send(embed=_format_job_guide(job_key))
 
 
 # =========================================================
