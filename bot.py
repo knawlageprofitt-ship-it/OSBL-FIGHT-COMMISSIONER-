@@ -591,7 +591,7 @@ FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
 FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
-JOB_PERMISSION_ENFORCEMENT_VERSION = "V1-JOB-PERMISSION-ENFORCEMENT-2026-09-10"
+JOB_PERMISSION_ENFORCEMENT_VERSION = "V2-JOB-PERMISSION-FIX-2026-09-10"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -1359,6 +1359,81 @@ async def _send_locked_fight_poster(ctx, booking_id):
     return True
 
 
+def _member_has_role_name(member, role_name):
+    target = str(role_name).casefold()
+    return any(str(role.name).casefold() == target for role in getattr(member, "roles", []))
+
+
+async def _job_permission_check(ctx, allowed_jobs, *, allow_official_without_session=False):
+    """
+    Commissioner always passes.
+    During an active Fight Night, OSBL Officials must be assigned to one of the
+    allowed jobs for the current session.
+    Outside an active Fight Night, normal Official access can remain available
+    only for commands explicitly configured with allow_official_without_session.
+    """
+    if _member_has_role_name(ctx.author, "OSBL COMMISSIONER"):
+        return True
+
+    is_official = _member_has_role_name(ctx.author, "OSBL OFFICIAL")
+    if not is_official:
+        raise commands.CheckFailure(
+            "⛔ **OSBL STAFF AUTHORIZATION REQUIRED**\n"
+            "You must have the **OSBL COMMISSIONER** or **OSBL OFFICIAL** Discord role."
+        )
+
+    async with bot.db.acquire() as conn:
+        session = await _active_fight_night_session(conn)
+
+        if not session:
+            if allow_official_without_session:
+                return True
+            raise commands.CheckFailure(
+                "⛔ **NO ACTIVE FIGHT NIGHT**\n"
+                "This command is controlled by Fight Night job assignments and can only "
+                "be used by an assigned staff member during an active Fight Night."
+            )
+
+        assigned = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM fight_night_staff_assignments
+                WHERE session_id = $1
+                  AND staff_user_id = $2
+                  AND job_key = ANY($3::text[])
+            )
+            """,
+            session["id"],
+            ctx.author.id,
+            list(allowed_jobs),
+        )
+
+    if assigned:
+        return True
+
+    readable = ", ".join(
+        OSBL_FIGHT_NIGHT_JOBS[job]["name"]
+        for job in allowed_jobs
+        if job in OSBL_FIGHT_NIGHT_JOBS
+    )
+    raise commands.CheckFailure(
+        "⛔ **FIGHT NIGHT JOB RESTRICTION**\n"
+        f"This command is restricted to: **{readable}**.\n"
+        "Use `!myjob` to view your current assignment."
+    )
+
+
+def fightnight_jobs_required(*job_keys, allow_official_without_session=False):
+    async def predicate(ctx):
+        return await _job_permission_check(
+            ctx,
+            tuple(job_keys),
+            allow_official_without_session=allow_official_without_session,
+        )
+    return commands.check(predicate)
+
+
 @bot.command()
 @fightnight_jobs_required("matchmaker", "media", "supervisor", allow_official_without_session=True)
 async def fightcardposter(ctx, booking_id: int = None):
@@ -1865,79 +1940,6 @@ def _normalize_fight_night_job(raw_job):
     return OSBL_FIGHT_NIGHT_JOB_ALIASES.get(key)
 
 
-def _member_has_role_name(member, role_name):
-    target = str(role_name).casefold()
-    return any(str(role.name).casefold() == target for role in getattr(member, "roles", []))
-
-
-async def _job_permission_check(ctx, allowed_jobs, *, allow_official_without_session=False):
-    """
-    Commissioner always passes.
-    During an active Fight Night, OSBL Officials must be assigned to one of the
-    allowed jobs for the current session.
-    Outside an active Fight Night, normal Official access can remain available
-    only for commands explicitly configured with allow_official_without_session.
-    """
-    if _member_has_role_name(ctx.author, "OSBL COMMISSIONER"):
-        return True
-
-    is_official = _member_has_role_name(ctx.author, "OSBL OFFICIAL")
-    if not is_official:
-        raise commands.CheckFailure(
-            "⛔ **OSBL STAFF AUTHORIZATION REQUIRED**\n"
-            "You must have the **OSBL COMMISSIONER** or **OSBL OFFICIAL** Discord role."
-        )
-
-    async with bot.db.acquire() as conn:
-        session = await _active_fight_night_session(conn)
-
-        if not session:
-            if allow_official_without_session:
-                return True
-            raise commands.CheckFailure(
-                "⛔ **NO ACTIVE FIGHT NIGHT**\n"
-                "This command is controlled by Fight Night job assignments and can only "
-                "be used by an assigned staff member during an active Fight Night."
-            )
-
-        assigned = await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM fight_night_staff_assignments
-                WHERE session_id = $1
-                  AND staff_user_id = $2
-                  AND job_key = ANY($3::text[])
-            )
-            """,
-            session["id"],
-            ctx.author.id,
-            list(allowed_jobs),
-        )
-
-    if assigned:
-        return True
-
-    readable = ", ".join(
-        OSBL_FIGHT_NIGHT_JOBS[job]["name"]
-        for job in allowed_jobs
-        if job in OSBL_FIGHT_NIGHT_JOBS
-    )
-    raise commands.CheckFailure(
-        "⛔ **FIGHT NIGHT JOB RESTRICTION**\n"
-        f"This command is restricted to: **{readable}**.\n"
-        "Use `!myjob` to view your current assignment."
-    )
-
-
-def fightnight_jobs_required(*job_keys, allow_official_without_session=False):
-    async def predicate(ctx):
-        return await _job_permission_check(
-            ctx,
-            tuple(job_keys),
-            allow_official_without_session=allow_official_without_session,
-        )
-    return commands.check(predicate)
 
 async def _active_fight_night_session(conn):
     return await conn.fetchrow(
