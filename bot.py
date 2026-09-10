@@ -591,6 +591,7 @@ FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
 FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
+JOB_PERMISSION_ENFORCEMENT_VERSION = "V1-JOB-PERMISSION-ENFORCEMENT-2026-09-10"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -897,6 +898,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="📘 Staff Command Guides",
         value=JOB_COMMAND_GUIDE_VERSION,
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔐 Job Permission Enforcement",
+        value=JOB_PERMISSION_ENFORCEMENT_VERSION,
         inline=False,
     )
 
@@ -1353,7 +1360,7 @@ async def _send_locked_fight_poster(ctx, booking_id):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("matchmaker", "media", "supervisor", allow_official_without_session=True)
 async def fightcardposter(ctx, booking_id: int = None):
     """Generate the premium OSBL visual fight card for one booking."""
     if booking_id is None:
@@ -1363,7 +1370,7 @@ async def fightcardposter(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("matchmaker", "media", "supervisor", allow_official_without_session=True)
 async def rerenderfightcard(ctx, booking_id: int = None):
     """Rebuild a booking poster from the latest saved fighter portraits and live data."""
     if booking_id is None:
@@ -1373,7 +1380,7 @@ async def rerenderfightcard(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("matchmaker", "media", "supervisor", allow_official_without_session=True)
 async def fightposter(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use `!fightposter <Booking ID>`")
@@ -1382,7 +1389,7 @@ async def fightposter(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("matchmaker", "media", "supervisor", allow_official_without_session=True)
 async def fightposterall(ctx):
     """Generate official posters for every currently locked matchup."""
     async with bot.db.acquire() as conn:
@@ -1552,7 +1559,7 @@ async def matchupcheck(ctx, *, details: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER")
+@fightnight_jobs_required("matchmaker")
 async def bookfight(ctx, *, details: str = None):
     if not details:
         await ctx.send(
@@ -1653,7 +1660,7 @@ async def bookfight(ctx, *, details: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER")
+@fightnight_jobs_required("matchmaker")
 async def lockfight(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use `!lockfight <Booking ID>`")
@@ -1713,7 +1720,7 @@ async def lockfight(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER")
+@fightnight_jobs_required("matchmaker")
 async def cancelbookedfight(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use `!cancelbookedfight <Booking ID>`")
@@ -1754,7 +1761,7 @@ async def cancelbookedfight(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("matchmaker", "media", "supervisor", "checkin", allow_official_without_session=True)
 async def fightcard(ctx):
     """
     Post the current OSBL Fight Card as finished visual poster(s) only.
@@ -1856,6 +1863,81 @@ OSBL_FIGHT_NIGHT_JOB_ALIASES = {
 def _normalize_fight_night_job(raw_job):
     key = re.sub(r"\s+", "", str(raw_job or "").strip().casefold())
     return OSBL_FIGHT_NIGHT_JOB_ALIASES.get(key)
+
+
+def _member_has_role_name(member, role_name):
+    target = str(role_name).casefold()
+    return any(str(role.name).casefold() == target for role in getattr(member, "roles", []))
+
+
+async def _job_permission_check(ctx, allowed_jobs, *, allow_official_without_session=False):
+    """
+    Commissioner always passes.
+    During an active Fight Night, OSBL Officials must be assigned to one of the
+    allowed jobs for the current session.
+    Outside an active Fight Night, normal Official access can remain available
+    only for commands explicitly configured with allow_official_without_session.
+    """
+    if _member_has_role_name(ctx.author, "OSBL COMMISSIONER"):
+        return True
+
+    is_official = _member_has_role_name(ctx.author, "OSBL OFFICIAL")
+    if not is_official:
+        raise commands.CheckFailure(
+            "⛔ **OSBL STAFF AUTHORIZATION REQUIRED**\n"
+            "You must have the **OSBL COMMISSIONER** or **OSBL OFFICIAL** Discord role."
+        )
+
+    async with bot.db.acquire() as conn:
+        session = await _active_fight_night_session(conn)
+
+        if not session:
+            if allow_official_without_session:
+                return True
+            raise commands.CheckFailure(
+                "⛔ **NO ACTIVE FIGHT NIGHT**\n"
+                "This command is controlled by Fight Night job assignments and can only "
+                "be used by an assigned staff member during an active Fight Night."
+            )
+
+        assigned = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM fight_night_staff_assignments
+                WHERE session_id = $1
+                  AND staff_user_id = $2
+                  AND job_key = ANY($3::text[])
+            )
+            """,
+            session["id"],
+            ctx.author.id,
+            list(allowed_jobs),
+        )
+
+    if assigned:
+        return True
+
+    readable = ", ".join(
+        OSBL_FIGHT_NIGHT_JOBS[job]["name"]
+        for job in allowed_jobs
+        if job in OSBL_FIGHT_NIGHT_JOBS
+    )
+    raise commands.CheckFailure(
+        "⛔ **FIGHT NIGHT JOB RESTRICTION**\n"
+        f"This command is restricted to: **{readable}**.\n"
+        "Use `!myjob` to view your current assignment."
+    )
+
+
+def fightnight_jobs_required(*job_keys, allow_official_without_session=False):
+    async def predicate(ctx):
+        return await _job_permission_check(
+            ctx,
+            tuple(job_keys),
+            allow_official_without_session=allow_official_without_session,
+        )
+    return commands.check(predicate)
 
 async def _active_fight_night_session(conn):
     return await conn.fetchrow(
@@ -2179,13 +2261,14 @@ OSBL_JOB_COMMAND_GUIDES = {
             "!fightnightfinance",
             "!fightnightrecap",
             "!fightnightlist",
+            "!endfightnight",
             "!systemcheck",
         ],
         "restrictions": [
             "Do not enter or alter fight results unless also assigned Results & Rankings.",
             "Do not process payouts unless also assigned Payout / Treasury.",
             "Do not book or lock fights unless also assigned Matchmaker.",
-            "Starting/ending Fight Night and emergency overrides remain Commissioner-only controls.",
+            "Starting Fight Night and emergency overrides remain Commissioner-only controls.",
         ],
         "escalate": "OSBL Commissioner",
     },
@@ -2204,16 +2287,14 @@ OSBL_JOB_COMMAND_GUIDES = {
         ],
         "commands": [
             "!matchupcheck Fighter One | Fighter Two",
-            "!fightcard",
-            "!fightcardposter <Booking ID>",
-            "!rerenderfightcard <Booking ID>",
-            "!fightposter <Booking ID>",
-        ],
-        "commissioner_commands": [
             "!bookfight Fighter One | Fighter Two",
             "!bookfight Fighter One | Fighter Two | championship",
             "!lockfight <Booking ID>",
             "!cancelbookedfight <Booking ID>",
+            "!fightcard",
+            "!fightcardposter <Booking ID>",
+            "!rerenderfightcard <Booking ID>",
+            "!fightposter <Booking ID>",
         ],
         "restrictions": [
             "Do not enter fight results or change RP/rankings.",
@@ -2399,9 +2480,9 @@ def _format_job_guide(job_key):
     embed.add_field(
         name="ℹ️ Permission Note",
         value=(
-            "This guide defines the **OSBL job policy**. Current command access is "
-            "still controlled by existing Discord roles until job-based command "
-            "enforcement is activated."
+            "✅ **Job-based command enforcement is ACTIVE.** During an active Fight Night, "
+            "sensitive station commands are limited to the staff member assigned to the "
+            "required job. The **OSBL COMMISSIONER** remains the full-access override."
         ),
         inline=False,
     )
@@ -2842,7 +2923,7 @@ async def _freeze_fightnight_financial_snapshot(conn, session):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER")
+@fightnight_jobs_required("supervisor")
 async def endfightnight(ctx):
     async with bot.db.acquire() as conn:
         async with conn.transaction():
@@ -3294,7 +3375,7 @@ async def confirmdeletefightnight(ctx, session_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout", "supervisor", allow_official_without_session=True)
 async def fightnightfinance(ctx, session_id: int = None):
     """
     Show Fight Night accounting.
@@ -5388,7 +5469,7 @@ async def confirmdeletetestseason(ctx, *, season_name: str = None):
 # ============================================================
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("results")
 async def result(ctx, *, details: str = None):
 
     if not details:
@@ -5816,7 +5897,7 @@ async def setrank(ctx, *, details: str = None):
 # ============================================
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("results")
 async def champresult(ctx, *, details: str = None):
 
     force_override = bool(getattr(ctx, "_osbl_force_champresult", False))
@@ -7157,7 +7238,7 @@ async def payoutrequest(ctx, *, request_text: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout", "supervisor", allow_official_without_session=True)
 async def payoutrequests(ctx):
     rows = await bot.db.fetch(
         """
@@ -7190,7 +7271,7 @@ async def payoutrequests(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout")
 async def payfighter(ctx, request_id: int = None):
     """Mark a pending payout request as actually paid."""
     if request_id is None:
@@ -7299,7 +7380,7 @@ async def payfighter(ctx, request_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout")
 async def rejectpayout(ctx, request_id: int = None):
     if request_id is None:
         await ctx.send("❌ Use: `!rejectpayout <Request ID>`")
@@ -8061,7 +8142,7 @@ async def normalizegyms(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout", "supervisor", allow_official_without_session=True)
 async def treasury(ctx):
     """League-wide OSBL financial dashboard."""
     snap = await _osbl_treasury_snapshot()
@@ -8186,7 +8267,7 @@ async def treasury(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout", "supervisor", allow_official_without_session=True)
 async def gymtreasury(ctx, *, gym_name: str = None):
     """Show the payout exposure for one official gym."""
     gym_name = " ".join(str(gym_name or "").strip().split())
@@ -8263,7 +8344,7 @@ async def gymtreasury(ctx, *, gym_name: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("payout", "supervisor", allow_official_without_session=True)
 async def treasurytop(ctx, limit: int = 10):
     """Show the fighters with the largest unpaid balances."""
     limit = max(1, min(int(limit or 10), 20))
@@ -9053,6 +9134,17 @@ async def on_command_error(ctx, error):
             "Only the OSBL Commissioner or OSBL Officials "
             "may use that command."
         )
+        return
+
+    if isinstance(error, commands.CheckFailure):
+        message = str(error).strip()
+        if message:
+            await ctx.send(message)
+        else:
+            await ctx.send(
+                "⛔ **OSBL JOB AUTHORIZATION REQUIRED**\n"
+                "Your current Fight Night assignment does not allow that command."
+            )
         return
 
     print(f"Command error: {error}")
