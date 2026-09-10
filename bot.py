@@ -593,6 +593,7 @@ FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
 JOB_PERMISSION_ENFORCEMENT_VERSION = "V2-JOB-PERMISSION-FIX-2026-09-10"
 STAFF_NAME_ASSIGNMENT_VERSION = "V1-DISPLAY-NAME-STAFF-ASSIGNMENT-2026-09-10"
+STAFF_DISPLAY_OUTPUT_VERSION = "V2-PLAIN-DISPLAY-NAME-OUTPUT-2026-09-10"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -911,6 +912,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🪪 Staff Assignment Names",
         value=STAFF_NAME_ASSIGNMENT_VERSION,
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📝 Staff Name Display",
+        value=STAFF_DISPLAY_OUTPUT_VERSION,
         inline=False,
     )
 
@@ -2149,7 +2156,7 @@ async def assignstaff(ctx, *, details: str = None):
         value=f"{job['emoji']} **{job['name']}**",
         inline=True,
     )
-    embed.add_field(name="Assigned To", value=member.mention, inline=False)
+    embed.add_field(name="Assigned To", value=f"**{member.display_name}**", inline=False)
     if previous and previous["staff_display_name"] != member.display_name:
         embed.add_field(
             name="Replaced",
@@ -2158,7 +2165,7 @@ async def assignstaff(ctx, *, details: str = None):
         )
     embed.add_field(
         name="Assigned By",
-        value=ctx.author.mention,
+        value=f"**{ctx.author.display_name}**",
         inline=False,
     )
     embed.set_footer(text=FIGHT_NIGHT_STAFF_VERSION)
@@ -2252,7 +2259,7 @@ async def fightnightstaff(ctx, session_id: int = None):
         row = assignments.get(job_key)
         if row:
             lines.append(
-                f"{job['emoji']} **{job['name']}** — <@{row['staff_user_id']}>"
+                f"{job['emoji']} **{job['name']}** — **{row['staff_display_name']}**"
             )
         else:
             lines.append(
@@ -2608,7 +2615,7 @@ async def myjob(ctx):
 
     if not rows:
         await ctx.send(
-            f"ℹ️ {ctx.author.mention}, you are not assigned to a Fight Night job "
+            f"ℹ️ **{ctx.author.display_name}**, you are not assigned to a Fight Night job "
             f"for **Session #{session['id']}**.\n"
             "Ask the OSBL Commissioner to assign you with `!assignstaff`."
         )
