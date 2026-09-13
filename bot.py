@@ -1,5 +1,6 @@
 
 import os
+import asyncio
 import re
 from difflib import SequenceMatcher
 import io
@@ -435,6 +436,63 @@ class OSBLBot(commands.Bot):
                 ON fighter_discord_links (discord_user_id);
             """)
 
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS commission_rulings (
+                    id BIGSERIAL PRIMARY KEY,
+                    booking_id BIGINT NOT NULL,
+                    fight_night_session_id BIGINT,
+                    fighter1_key TEXT NOT NULL,
+                    fighter1_name TEXT NOT NULL,
+                    fighter2_key TEXT NOT NULL,
+                    fighter2_name TEXT NOT NULL,
+                    division TEXT NOT NULL,
+                    bout_type TEXT NOT NULL,
+                    issue_reviewed TEXT NOT NULL,
+                    ruling_text TEXT NOT NULL,
+                    reason_text TEXT NOT NULL,
+                    actions_json TEXT NOT NULL DEFAULT '[]',
+                    other_action_text TEXT,
+                    status TEXT NOT NULL DEFAULT 'final',
+                    is_correction BOOLEAN NOT NULL DEFAULT FALSE,
+                    supersedes_ruling_id BIGINT,
+                    correction_note TEXT,
+                    issued_by_id BIGINT NOT NULL,
+                    issued_by_name TEXT NOT NULL,
+                    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    posted_channel_id BIGINT,
+                    posted_message_id BIGINT
+                );
+            """)
+
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS one_final_commission_ruling_per_booking
+                ON commission_rulings (booking_id)
+                WHERE status = 'final';
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS commission_rulings_booking_idx
+                ON commission_rulings (booking_id, id DESC);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS commission_ruling_audit (
+                    id BIGSERIAL PRIMARY KEY,
+                    ruling_id BIGINT NOT NULL,
+                    booking_id BIGINT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor_id BIGINT NOT NULL,
+                    actor_name TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS commission_ruling_audit_booking_idx
+                ON commission_ruling_audit (booking_id, id DESC);
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -597,6 +655,7 @@ STAFF_DISPLAY_OUTPUT_VERSION = "V2-PLAIN-DISPLAY-NAME-OUTPUT-2026-09-10"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
+COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -627,6 +686,8 @@ async def systemcheck(ctx):
         "payout_requests",
         "payout_cashouts",
         "fighter_discord_links",
+        "commission_rulings",
+        "commission_ruling_audit",
     ]
 
     try:
@@ -777,6 +838,10 @@ async def systemcheck(ctx):
         "duplicatefightercheck",
         "mergefighter",
         "treasurytop",
+        "ruling",
+        "rulingstatus",
+        "rulinghistory",
+        "correctruling",
     ]
 
     missing_commands = []
@@ -2321,6 +2386,12 @@ OSBL_JOB_COMMAND_GUIDES = {
             "!fightnightlist",
             "!endfightnight",
             "!systemcheck",
+            "!ruling <Booking ID>",
+            "!rulingstatus <Ruling ID>",
+            "!rulinghistory [Booking ID]",
+        ],
+        "commissioner_commands": [
+            "!correctruling <Ruling ID>",
         ],
         "restrictions": [
             "Do not enter or alter fight results unless also assigned Results & Rankings.",
@@ -2629,6 +2700,963 @@ async def myjob(ctx):
         job_key = row["job_key"]
         if job_key in OSBL_JOB_COMMAND_GUIDES:
             await ctx.send(embed=_format_job_guide(job_key))
+
+
+# =========================================================
+# OSBL COMMISSION RULINGS SYSTEM
+# Final staff-only ruling record, department routing, corrections,
+# and audit history. Rulings NEVER mutate fight records, rankings,
+# titles, or money automatically; affected desks must carry out
+# the approved action through their normal controlled workflow.
+# =========================================================
+
+COMMISSION_RULING_ACTIONS = {
+    "1": ("no_change", "No Change"),
+    "2": ("result_change", "Result Change"),
+    "3": ("disqualification", "Disqualification"),
+    "4": ("draw", "Draw"),
+    "5": ("rematch", "Rematch"),
+    "6": ("suspension_discipline", "Suspension / Discipline"),
+    "7": ("payout_hold", "Payout Hold"),
+    "8": ("payout_release", "Payout Release"),
+    "9": ("ranking_update", "Ranking Update"),
+    "10": ("title_action", "Championship / Title Action"),
+    "11": ("other", "Other"),
+}
+COMMISSION_RULING_ACTION_LABELS = {
+    code: label for code, label in (value for value in COMMISSION_RULING_ACTIONS.values())
+}
+
+COMMISSION_RULING_CHANNELS = {
+    "official": ("commission-rulings", "commission_rulings"),
+    "results": ("staff-records", "results-rankings", "results-and-rankings"),
+    "matchmaking": ("match-making", "matchmaking"),
+    "payout": ("payouts", "payout", "treasury"),
+    "discipline": ("violations-and-reviews", "violations-reviews"),
+    "supervisor": ("osbl-staff-command-center", "staff-command-center"),
+}
+
+COMMISSION_RULING_ROUTE_MAP = {
+    "result_change": ("results",),
+    "disqualification": ("results",),
+    "draw": ("results",),
+    "rematch": ("matchmaking",),
+    "suspension_discipline": ("discipline",),
+    "payout_hold": ("payout",),
+    "payout_release": ("payout",),
+    "ranking_update": ("results",),
+    "title_action": ("results", "supervisor"),
+    "other": ("supervisor",),
+}
+
+
+def _normalize_channel_name(value):
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").casefold()).strip("-")
+
+
+def _find_osbl_text_channel(guild, purpose):
+    if guild is None:
+        return None
+    wanted = {
+        _normalize_channel_name(name)
+        for name in COMMISSION_RULING_CHANNELS.get(purpose, ())
+    }
+    for channel in getattr(guild, "text_channels", []):
+        if _normalize_channel_name(channel.name) in wanted:
+            return channel
+    return None
+
+
+def _clip_ruling_text(value, limit=1000):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _decode_ruling_actions(raw_value):
+    try:
+        data = json.loads(raw_value or "[]")
+        if isinstance(data, list):
+            return [str(item) for item in data]
+    except Exception:
+        pass
+    return []
+
+
+def _ruling_action_labels(actions, other_action_text=None):
+    lines = []
+    for action in actions:
+        label = COMMISSION_RULING_ACTION_LABELS.get(action, action.replace("_", " ").title())
+        if action == "other" and other_action_text:
+            lines.append(f"• **{label}:** {other_action_text}")
+        else:
+            lines.append(f"• **{label}**")
+    return lines or ["• **No Change**"]
+
+
+def _ruling_action_menu():
+    return "\n".join(
+        f"`{number}` — {label}"
+        for number, (_, label) in COMMISSION_RULING_ACTIONS.items()
+    )
+
+
+def _parse_ruling_actions(raw_value):
+    raw = str(raw_value or "").strip().casefold()
+    if not raw:
+        return None, "No action was selected."
+
+    tokens = [token for token in re.split(r"[,\s]+", raw) if token]
+    selected = []
+    invalid = []
+
+    by_code = {code: key for code, (key, _) in COMMISSION_RULING_ACTIONS.items()}
+    aliases = {
+        "nochange": "no_change",
+        "no_change": "no_change",
+        "result": "result_change",
+        "resultchange": "result_change",
+        "dq": "disqualification",
+        "disqualification": "disqualification",
+        "draw": "draw",
+        "rematch": "rematch",
+        "discipline": "suspension_discipline",
+        "suspension": "suspension_discipline",
+        "hold": "payout_hold",
+        "payouthold": "payout_hold",
+        "release": "payout_release",
+        "payoutrelease": "payout_release",
+        "ranking": "ranking_update",
+        "rankings": "ranking_update",
+        "title": "title_action",
+        "championship": "title_action",
+        "other": "other",
+    }
+
+    for token in tokens:
+        key = by_code.get(token)
+        if not key:
+            compact = re.sub(r"[^a-z0-9_]+", "", token)
+            key = aliases.get(compact)
+        if not key:
+            invalid.append(token)
+            continue
+        if key not in selected:
+            selected.append(key)
+
+    if invalid:
+        return None, "Invalid selection(s): " + ", ".join(invalid)
+    if not selected:
+        return None, "No valid action was selected."
+    if "no_change" in selected and len(selected) > 1:
+        return None, "No Change cannot be combined with another action."
+    return selected, None
+
+
+async def _wait_for_staff_reply(ctx, prompt, *, timeout=300, max_chars=1000, allow_cancel=True):
+    await ctx.send(prompt)
+
+    def check(message):
+        return message.author.id == ctx.author.id and message.channel.id == ctx.channel.id
+
+    try:
+        message = await bot.wait_for("message", check=check, timeout=timeout)
+    except asyncio.TimeoutError:
+        await ctx.send("⌛ **RULING WORKFLOW EXPIRED** — no changes were saved.")
+        return None
+
+    value = str(message.content or "").strip()
+    if allow_cancel and value.casefold() == "cancel":
+        await ctx.send("❎ **RULING WORKFLOW CANCELLED** — no changes were saved.")
+        return None
+    if not value:
+        await ctx.send("❌ A response is required. Start the command again.")
+        return None
+    if len(value) > max_chars:
+        await ctx.send(
+            f"❌ That response is too long (**{len(value)}** characters). "
+            f"Maximum: **{max_chars}**. Start the command again."
+        )
+        return None
+    return value
+
+
+async def _fetch_ruling_booking(booking_id):
+    async with bot.db.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT id, fighter1_key, fighter1_name, fighter2_key, fighter2_name,
+                   division, bout_type, status, fight_night_session_id,
+                   booked_by_name, booked_at, locked_by_name, locked_at
+            FROM fight_bookings
+            WHERE id = $1
+            """,
+            booking_id,
+        )
+
+
+async def _can_issue_commission_ruling(ctx, booking):
+    if _member_has_role_name(ctx.author, "OSBL COMMISSIONER"):
+        return True, None
+
+    if not _member_has_role_name(ctx.author, "OSBL OFFICIAL"):
+        return False, (
+            "⛔ **OSBL STAFF AUTHORIZATION REQUIRED**\n"
+            "Only the **OSBL Commissioner** or the authorized **Fight Night Supervisor** "
+            "may issue a final commission ruling."
+        )
+
+    session_id = booking["fight_night_session_id"]
+    if not session_id:
+        return False, (
+            "⛔ **COMMISSIONER APPROVAL REQUIRED**\n"
+            "This booking is not attached to a Fight Night session, so a Supervisor "
+            "assignment cannot be verified."
+        )
+
+    async with bot.db.acquire() as conn:
+        assigned = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM fight_night_staff_assignments
+                WHERE session_id = $1
+                  AND staff_user_id = $2
+                  AND job_key = 'supervisor'
+            )
+            """,
+            session_id,
+            ctx.author.id,
+        )
+
+    if assigned:
+        return True, None
+
+    return False, (
+        "⛔ **SUPERVISOR AUTHORIZATION REQUIRED**\n"
+        f"You were not assigned as the Fight Night Supervisor for Session **#{session_id}**.\n"
+        "Escalate this ruling to the OSBL Commissioner."
+    )
+
+
+def _build_commission_ruling_embed(row, *, corrected=False):
+    actions = _decode_ruling_actions(row["actions_json"])
+    title = (
+        "⚖️ OSBL CORRECTED COMMISSION RULING"
+        if corrected or bool(row["is_correction"])
+        else "⚖️ OSBL OFFICIAL COMMISSION RULING"
+    )
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"**Ruling ID:** #{row['id']}\n"
+            f"**Booking ID:** #{row['booking_id']}\n"
+            f"**Status:** {str(row['status']).upper()}"
+        ),
+        color=discord.Color.red() if bool(row["is_correction"]) else discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🥊 Fighters",
+        value=f"**{row['fighter1_name']}** vs **{row['fighter2_name']}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏷️ Bout",
+        value=f"{row['division']} • {str(row['bout_type']).title()}",
+        inline=True,
+    )
+    if row["fight_night_session_id"]:
+        embed.add_field(
+            name="🎧 Fight Night",
+            value=f"Session #{row['fight_night_session_id']}",
+            inline=True,
+        )
+    embed.add_field(
+        name="📌 Issue Reviewed",
+        value=_clip_ruling_text(row["issue_reviewed"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚖️ Official Ruling",
+        value=_clip_ruling_text(row["ruling_text"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="📝 Reason",
+        value=_clip_ruling_text(row["reason_text"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔧 Action Required",
+        value="\n".join(_ruling_action_labels(actions, row["other_action_text"])),
+        inline=False,
+    )
+    if row["is_correction"]:
+        embed.add_field(
+            name="🛠️ Correction Record",
+            value=(
+                f"Supersedes Ruling **#{row['supersedes_ruling_id']}**\n"
+                f"Correction Note: {_clip_ruling_text(row['correction_note'], 800)}"
+            ),
+            inline=False,
+        )
+    embed.add_field(
+        name="👑 Issued By",
+        value=f"**{row['issued_by_name']}**",
+        inline=False,
+    )
+    issued_at = row["issued_at"]
+    if issued_at:
+        embed.timestamp = issued_at
+    embed.add_field(
+        name="🛡️ Record Protection",
+        value=(
+            "This command records and routes the ruling only. It does **not** automatically "
+            "change fight results, RP, rankings, titles, bookings, or payouts. The affected "
+            "staff desk must complete and verify the approved action."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{COMMISSION_RULING_VERSION} • ONE LEAGUE • ONE STANDARD • ONE CHAMPION")
+    return embed
+
+
+async def _route_commission_ruling(guild, ruling_row):
+    actions = _decode_ruling_actions(ruling_row["actions_json"])
+    targets = {}
+    for action in actions:
+        for purpose in COMMISSION_RULING_ROUTE_MAP.get(action, ()):
+            targets.setdefault(purpose, []).append(action)
+
+    delivered = []
+    missing = []
+    for purpose, purpose_actions in targets.items():
+        channel = _find_osbl_text_channel(guild, purpose)
+        if not channel:
+            missing.append(purpose)
+            continue
+
+        action_lines = []
+        for action in purpose_actions:
+            label = COMMISSION_RULING_ACTION_LABELS.get(action, action.replace("_", " ").title())
+            action_lines.append(f"• **{label}**")
+
+        embed = discord.Embed(
+            title="🚨 OSBL COMMISSION RULING — ACTION REQUIRED",
+            description=(
+                f"**Ruling ID:** #{ruling_row['id']}\n"
+                f"**Booking ID:** #{ruling_row['booking_id']}\n"
+                f"**Fight:** {ruling_row['fighter1_name']} vs {ruling_row['fighter2_name']}"
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Assigned Action",
+            value="\n".join(action_lines),
+            inline=False,
+        )
+        embed.add_field(
+            name="Official Ruling",
+            value=_clip_ruling_text(ruling_row["ruling_text"], 800),
+            inline=False,
+        )
+        embed.add_field(
+            name="Staff Instruction",
+            value=(
+                "Carry out only the action authorized by the ruling, verify the affected "
+                "record/ledger afterward, and escalate any conflict before making additional changes."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Official source: #commission-rulings • {COMMISSION_RULING_VERSION}")
+        try:
+            await channel.send(embed=embed)
+            delivered.append(channel.name)
+        except Exception as exc:
+            print(f"Commission ruling routing error to {channel.name}: {type(exc).__name__}: {exc}")
+            missing.append(channel.name)
+
+    return delivered, missing
+
+
+async def _insert_commission_ruling(
+    ctx,
+    booking,
+    issue_reviewed,
+    ruling_text,
+    reason_text,
+    actions,
+    other_action_text=None,
+    *,
+    is_correction=False,
+    supersedes_ruling_id=None,
+    correction_note=None,
+):
+    official_channel = _find_osbl_text_channel(ctx.guild, "official")
+    if official_channel is None:
+        return None, None, [], ["commission-rulings"]
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            existing = await conn.fetchrow(
+                """
+                SELECT id
+                FROM commission_rulings
+                WHERE booking_id = $1 AND status = 'final'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                booking["id"],
+            )
+
+            if existing and not is_correction:
+                return {"duplicate_id": existing["id"]}, None, [], []
+
+            if is_correction:
+                if not existing or existing["id"] != supersedes_ruling_id:
+                    return {"correction_conflict": True}, None, [], []
+                await conn.execute(
+                    "UPDATE commission_rulings SET status = 'superseded' WHERE id = $1",
+                    supersedes_ruling_id,
+                )
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO commission_rulings (
+                    booking_id, fight_night_session_id,
+                    fighter1_key, fighter1_name, fighter2_key, fighter2_name,
+                    division, bout_type, issue_reviewed, ruling_text, reason_text,
+                    actions_json, other_action_text, status, is_correction,
+                    supersedes_ruling_id, correction_note,
+                    issued_by_id, issued_by_name
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                    'final',$14,$15,$16,$17,$18
+                )
+                RETURNING *
+                """,
+                booking["id"],
+                booking["fight_night_session_id"],
+                booking["fighter1_key"],
+                booking["fighter1_name"],
+                booking["fighter2_key"],
+                booking["fighter2_name"],
+                booking["division"],
+                booking["bout_type"],
+                issue_reviewed,
+                ruling_text,
+                reason_text,
+                json.dumps(actions),
+                other_action_text,
+                bool(is_correction),
+                supersedes_ruling_id,
+                correction_note,
+                ctx.author.id,
+                ctx.author.display_name,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO commission_ruling_audit (
+                    ruling_id, booking_id, event_type, actor_id, actor_name, details_json
+                )
+                VALUES ($1,$2,$3,$4,$5,$6)
+                """,
+                row["id"],
+                booking["id"],
+                "corrected" if is_correction else "issued",
+                ctx.author.id,
+                ctx.author.display_name,
+                json.dumps({
+                    "actions": actions,
+                    "supersedes_ruling_id": supersedes_ruling_id,
+                    "correction_note": correction_note,
+                }, sort_keys=True),
+            )
+
+    embed = _build_commission_ruling_embed(row, corrected=is_correction)
+    try:
+        posted = await official_channel.send(embed=embed)
+    except Exception as exc:
+        # A ruling is not considered FINAL unless the official post succeeds.
+        # If a correction post fails, restore the previous ruling as FINAL.
+        async with bot.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE commission_rulings SET status = 'post_failed' WHERE id = $1",
+                    row["id"],
+                )
+                if is_correction and supersedes_ruling_id:
+                    await conn.execute(
+                        "UPDATE commission_rulings SET status = 'final' WHERE id = $1",
+                        supersedes_ruling_id,
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO commission_ruling_audit (
+                        ruling_id, booking_id, event_type, actor_id, actor_name, details_json
+                    )
+                    VALUES ($1,$2,'post_failed',$3,$4,$5)
+                    """,
+                    row["id"], booking["id"], ctx.author.id, ctx.author.display_name,
+                    json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
+                )
+        return {"post_failed": True, "ruling_id": row["id"]}, None, [], ["commission-rulings-post-failed"]
+
+    async with bot.db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE commission_rulings
+            SET posted_channel_id = $1, posted_message_id = $2
+            WHERE id = $3
+            """,
+            official_channel.id,
+            posted.id,
+            row["id"],
+        )
+        await conn.execute(
+            """
+            INSERT INTO commission_ruling_audit (
+                ruling_id, booking_id, event_type, actor_id, actor_name, details_json
+            )
+            VALUES ($1,$2,'posted',$3,$4,$5)
+            """,
+            row["id"], booking["id"], ctx.author.id, ctx.author.display_name,
+            json.dumps({"channel_id": official_channel.id, "message_id": posted.id}),
+        )
+        row = await conn.fetchrow("SELECT * FROM commission_rulings WHERE id = $1", row["id"])
+
+    delivered, missing = await _route_commission_ruling(ctx.guild, row)
+    return row, posted, delivered, missing
+
+
+async def _collect_ruling_fields(ctx, *, existing=None):
+    keep_mode = existing is not None
+    keep_note = "\nType `KEEP` to retain the current value." if keep_mode else ""
+
+    issue = await _wait_for_staff_reply(
+        ctx,
+        "📌 **ISSUE REVIEWED**\nEnter the issue being ruled on (example: `Fighter / Gang Interference`)."
+        + keep_note
+        + "\nType `CANCEL` at any time to stop.",
+        max_chars=250,
+    )
+    if issue is None:
+        return None
+    if keep_mode and issue.casefold() == "keep":
+        issue = existing["issue_reviewed"]
+
+    ruling_text = await _wait_for_staff_reply(
+        ctx,
+        "⚖️ **OFFICIAL RULING**\nEnter the final decision." + keep_note,
+        max_chars=1000,
+    )
+    if ruling_text is None:
+        return None
+    if keep_mode and ruling_text.casefold() == "keep":
+        ruling_text = existing["ruling_text"]
+
+    reason = await _wait_for_staff_reply(
+        ctx,
+        "📝 **REASON**\nEnter a short, fact-based explanation for the ruling." + keep_note,
+        max_chars=1000,
+    )
+    if reason is None:
+        return None
+    if keep_mode and reason.casefold() == "keep":
+        reason = existing["reason_text"]
+
+    if keep_mode:
+        current_labels = "\n".join(_ruling_action_labels(
+            _decode_ruling_actions(existing["actions_json"]),
+            existing["other_action_text"],
+        ))
+        action_prompt = (
+            "🔧 **ACTION REQUIRED**\n"
+            "Choose one or more numbers separated by commas, or type `KEEP`.\n\n"
+            + _ruling_action_menu()
+            + "\n\n**Current actions:**\n"
+            + current_labels
+        )
+    else:
+        action_prompt = (
+            "🔧 **ACTION REQUIRED**\n"
+            "Choose one or more numbers separated by commas.\n\n"
+            + _ruling_action_menu()
+            + "\n\nExample: `2,5,7`"
+        )
+
+    action_raw = await _wait_for_staff_reply(ctx, action_prompt, max_chars=200)
+    if action_raw is None:
+        return None
+
+    other_action_text = None
+    if keep_mode and action_raw.casefold() == "keep":
+        actions = _decode_ruling_actions(existing["actions_json"])
+        other_action_text = existing["other_action_text"]
+    else:
+        actions, action_error = _parse_ruling_actions(action_raw)
+        if action_error:
+            await ctx.send(f"❌ **INVALID ACTION SELECTION**\n{action_error}\nStart the command again.")
+            return None
+        if "other" in actions:
+            other_action_text = await _wait_for_staff_reply(
+                ctx,
+                "🧩 **OTHER ACTION**\nDescribe the additional action required.",
+                max_chars=500,
+            )
+            if other_action_text is None:
+                return None
+
+    return {
+        "issue_reviewed": issue,
+        "ruling_text": ruling_text,
+        "reason_text": reason,
+        "actions": actions,
+        "other_action_text": other_action_text,
+    }
+
+
+@bot.command()
+async def ruling(ctx, booking_id: int = None):
+    """
+    Guided final Commission Ruling workflow.
+    Commissioner, or the Supervisor assigned to the booking's Fight Night session.
+    """
+    if booking_id is None:
+        await ctx.send("❌ Use: `!ruling <Booking ID>`")
+        return
+
+    booking = await _fetch_ruling_booking(booking_id)
+    if not booking:
+        await ctx.send(f"❌ Booking **#{booking_id}** was not found.")
+        return
+
+    allowed, denial = await _can_issue_commission_ruling(ctx, booking)
+    if not allowed:
+        await ctx.send(denial)
+        return
+
+    official_channel = _find_osbl_text_channel(ctx.guild, "official")
+    if official_channel is None:
+        await ctx.send(
+            "❌ **#commission-rulings NOT FOUND**\n"
+            "Create the staff-only channel named `commission-rulings` before issuing a ruling."
+        )
+        return
+
+    async with bot.db.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT id
+            FROM commission_rulings
+            WHERE booking_id = $1 AND status = 'final'
+            ORDER BY id DESC LIMIT 1
+            """,
+            booking_id,
+        )
+    if existing:
+        await ctx.send(
+            "🛑 **FINAL RULING ALREADY EXISTS**\n"
+            f"Booking **#{booking_id}** already has active Ruling **#{existing['id']}**.\n"
+            f"Use `!rulingstatus {existing['id']}` to review it.\n"
+            f"Commissioner correction: `!correctruling {existing['id']}`"
+        )
+        return
+
+    await ctx.send(
+        "⚖️ **OSBL COMMISSION RULING WORKFLOW STARTED**\n"
+        f"Booking: **#{booking['id']}**\n"
+        f"Fight: **{booking['fighter1_name']} vs {booking['fighter2_name']}**\n"
+        f"Division: **{booking['division']}** • Bout: **{str(booking['bout_type']).title()}**\n\n"
+        "Nothing becomes official until you confirm the final preview."
+    )
+
+    fields = await _collect_ruling_fields(ctx)
+    if fields is None:
+        return
+
+    preview_row = {
+        "id": "PREVIEW",
+        "booking_id": booking["id"],
+        "fight_night_session_id": booking["fight_night_session_id"],
+        "fighter1_name": booking["fighter1_name"],
+        "fighter2_name": booking["fighter2_name"],
+        "division": booking["division"],
+        "bout_type": booking["bout_type"],
+        "issue_reviewed": fields["issue_reviewed"],
+        "ruling_text": fields["ruling_text"],
+        "reason_text": fields["reason_text"],
+        "actions_json": json.dumps(fields["actions"]),
+        "other_action_text": fields["other_action_text"],
+        "status": "preview",
+        "is_correction": False,
+        "supersedes_ruling_id": None,
+        "correction_note": None,
+        "issued_by_name": ctx.author.display_name,
+        "issued_at": None,
+    }
+    await ctx.send("🔎 **FINAL PREVIEW — NOTHING SAVED YET**", embed=_build_commission_ruling_embed(preview_row))
+
+    confirmation = await _wait_for_staff_reply(
+        ctx,
+        "Type **`CONFIRM RULING`** to make this official, or `CANCEL`.",
+        max_chars=50,
+    )
+    if confirmation is None:
+        return
+    if confirmation.casefold() != "confirm ruling":
+        await ctx.send("❌ Confirmation did not match `CONFIRM RULING`. No ruling was saved.")
+        return
+
+    row, posted, delivered, missing = await _insert_commission_ruling(
+        ctx,
+        booking,
+        fields["issue_reviewed"],
+        fields["ruling_text"],
+        fields["reason_text"],
+        fields["actions"],
+        fields["other_action_text"],
+    )
+
+    if isinstance(row, dict) and row.get("duplicate_id"):
+        await ctx.send(
+            f"🛑 A final ruling was created while this workflow was open. "
+            f"Use `!rulingstatus {row['duplicate_id']}`."
+        )
+        return
+    if isinstance(row, dict) and row.get("post_failed"):
+        await ctx.send(
+            "❌ **OFFICIAL RULING POST FAILED**\n"
+            f"Draft Ruling ID **#{row['ruling_id']}** was marked `POST_FAILED` and is **not** the active final ruling.\n"
+            "Check the bot's Send Messages / Embed Links permissions in `#commission-rulings`, then run `!ruling <Booking ID>` again."
+        )
+        return
+    if row is None:
+        await ctx.send("❌ The official `#commission-rulings` channel could not be located. Nothing was saved.")
+        return
+
+    route_text = (
+        ", ".join(f"#{name}" for name in delivered)
+        if delivered else "No department routing required."
+    )
+    warning_text = ""
+    if missing:
+        warning_text = "\n⚠️ Routing warning: " + ", ".join(missing)
+
+    await ctx.send(
+        "✅ **OSBL COMMISSION RULING RECORDED**\n"
+        f"Ruling ID: **#{row['id']}**\n"
+        f"Booking ID: **#{row['booking_id']}**\n"
+        f"Official ruling posted in **#{_find_osbl_text_channel(ctx.guild, 'official').name}**.\n"
+        f"Department flags: {route_text}"
+        + warning_text
+        + "\n\nNo fight record, RP, ranking, title, booking, or payout was changed automatically."
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def rulingstatus(ctx, ruling_id: int = None):
+    if ruling_id is None:
+        await ctx.send("❌ Use: `!rulingstatus <Ruling ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM commission_rulings WHERE id = $1", ruling_id)
+        if not row:
+            await ctx.send(f"❌ Ruling **#{ruling_id}** was not found.")
+            return
+        superseded_by = await conn.fetchval(
+            "SELECT id FROM commission_rulings WHERE supersedes_ruling_id = $1 ORDER BY id DESC LIMIT 1",
+            ruling_id,
+        )
+
+    embed = _build_commission_ruling_embed(row)
+    if superseded_by:
+        embed.add_field(
+            name="➡️ Superseded By",
+            value=f"Ruling **#{superseded_by}**",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def rulinghistory(ctx, booking_id: int = None):
+    async with bot.db.acquire() as conn:
+        if booking_id is None:
+            rows = await conn.fetch(
+                "SELECT * FROM commission_rulings ORDER BY id DESC LIMIT 10"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM commission_rulings WHERE booking_id = $1 ORDER BY id ASC",
+                booking_id,
+            )
+
+    if not rows:
+        if booking_id is None:
+            await ctx.send("ℹ️ No Commission Rulings have been recorded yet.")
+        else:
+            await ctx.send(f"ℹ️ No Commission Rulings were found for Booking **#{booking_id}**.")
+        return
+
+    lines = []
+    for row in rows:
+        correction = " • CORRECTION" if row["is_correction"] else ""
+        lines.append(
+            f"**Ruling #{row['id']}** — Booking #{row['booking_id']} — "
+            f"{str(row['status']).upper()}{correction}\n"
+            f"{row['fighter1_name']} vs {row['fighter2_name']}\n"
+            f"Issued by **{row['issued_by_name']}**"
+        )
+
+    embed = discord.Embed(
+        title=(
+            f"⚖️ OSBL RULING HISTORY — BOOKING #{booking_id}"
+            if booking_id is not None
+            else "⚖️ OSBL RECENT COMMISSION RULINGS"
+        ),
+        description="\n\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=COMMISSION_RULING_VERSION)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def correctruling(ctx, ruling_id: int = None):
+    """Commissioner-only correction that preserves the original ruling in history."""
+    if ruling_id is None:
+        await ctx.send("❌ Use: `!correctruling <Ruling ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT * FROM commission_rulings WHERE id = $1",
+            ruling_id,
+        )
+    if not existing:
+        await ctx.send(f"❌ Ruling **#{ruling_id}** was not found.")
+        return
+    if existing["status"] != "final":
+        await ctx.send(
+            f"🛑 Ruling **#{ruling_id}** is **{str(existing['status']).upper()}** and cannot be corrected directly.\n"
+            "Use the current FINAL ruling in the chain."
+        )
+        return
+
+    booking = await _fetch_ruling_booking(existing["booking_id"])
+    if not booking:
+        # Use the immutable ruling snapshot if the booking record is ever unavailable.
+        booking = {
+            "id": existing["booking_id"],
+            "fight_night_session_id": existing["fight_night_session_id"],
+            "fighter1_key": existing["fighter1_key"],
+            "fighter1_name": existing["fighter1_name"],
+            "fighter2_key": existing["fighter2_key"],
+            "fighter2_name": existing["fighter2_name"],
+            "division": existing["division"],
+            "bout_type": existing["bout_type"],
+        }
+
+    await ctx.send(
+        "🛠️ **OSBL RULING CORRECTION WORKFLOW**\n"
+        f"Current Ruling: **#{ruling_id}**\n"
+        f"Booking: **#{existing['booking_id']}**\n"
+        "The original ruling will remain in history as **SUPERSEDED**.\n"
+        "Type `KEEP` during a field to retain the current value."
+    )
+
+    correction_note = await _wait_for_staff_reply(
+        ctx,
+        "📝 **CORRECTION NOTE**\nExplain why the official ruling is being corrected.",
+        max_chars=800,
+    )
+    if correction_note is None:
+        return
+
+    fields = await _collect_ruling_fields(ctx, existing=existing)
+    if fields is None:
+        return
+
+    preview_row = {
+        "id": "PREVIEW",
+        "booking_id": booking["id"],
+        "fight_night_session_id": booking["fight_night_session_id"],
+        "fighter1_name": booking["fighter1_name"],
+        "fighter2_name": booking["fighter2_name"],
+        "division": booking["division"],
+        "bout_type": booking["bout_type"],
+        "issue_reviewed": fields["issue_reviewed"],
+        "ruling_text": fields["ruling_text"],
+        "reason_text": fields["reason_text"],
+        "actions_json": json.dumps(fields["actions"]),
+        "other_action_text": fields["other_action_text"],
+        "status": "preview",
+        "is_correction": True,
+        "supersedes_ruling_id": existing["id"],
+        "correction_note": correction_note,
+        "issued_by_name": ctx.author.display_name,
+        "issued_at": None,
+    }
+    await ctx.send("🔎 **CORRECTION PREVIEW — NOTHING SAVED YET**", embed=_build_commission_ruling_embed(preview_row, corrected=True))
+
+    confirmation = await _wait_for_staff_reply(
+        ctx,
+        "Type **`CONFIRM CORRECTION`** to supersede the old ruling, or `CANCEL`.",
+        max_chars=50,
+    )
+    if confirmation is None:
+        return
+    if confirmation.casefold() != "confirm correction":
+        await ctx.send("❌ Confirmation did not match `CONFIRM CORRECTION`. No changes were saved.")
+        return
+
+    row, posted, delivered, missing = await _insert_commission_ruling(
+        ctx,
+        booking,
+        fields["issue_reviewed"],
+        fields["ruling_text"],
+        fields["reason_text"],
+        fields["actions"],
+        fields["other_action_text"],
+        is_correction=True,
+        supersedes_ruling_id=existing["id"],
+        correction_note=correction_note,
+    )
+
+    if isinstance(row, dict) and row.get("correction_conflict"):
+        await ctx.send("🛑 The ruling changed while this correction workflow was open. Review the current ruling history and try again.")
+        return
+    if isinstance(row, dict) and row.get("post_failed"):
+        await ctx.send(
+            "❌ **CORRECTION POST FAILED**\n"
+            f"Correction draft **#{row['ruling_id']}** was marked `POST_FAILED`.\n"
+            f"Ruling **#{existing['id']}** remains the active FINAL ruling.\n"
+            "Check `#commission-rulings` permissions and try the correction again."
+        )
+        return
+    if row is None:
+        await ctx.send("❌ Correction could not be posted. Review `#commission-rulings` and try again.")
+        return
+
+    route_text = ", ".join(f"#{name}" for name in delivered) if delivered else "No department routing required."
+    warning_text = "\n⚠️ Routing warning: " + ", ".join(missing) if missing else ""
+    await ctx.send(
+        "✅ **COMMISSION RULING CORRECTED**\n"
+        f"Old Ruling: **#{existing['id']} — SUPERSEDED**\n"
+        f"New Ruling: **#{row['id']} — FINAL**\n"
+        f"Department flags: {route_text}"
+        + warning_text
+        + "\n\nThe original ruling remains preserved in the official audit history."
+    )
 
 
 # =========================================================
