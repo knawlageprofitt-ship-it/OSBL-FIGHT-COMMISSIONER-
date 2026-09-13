@@ -475,6 +475,20 @@ class OSBLBot(commands.Bot):
                 ON commission_rulings (booking_id, id DESC);
             """)
 
+            # Archive lifecycle fields are added as a safe in-place migration so
+            # existing ruling records remain intact. A ruling stays FINAL after
+            # archival; archive metadata is tracked separately so duplicate-final
+            # protection for each Booking ID remains enforced.
+            await conn.execute("""
+                ALTER TABLE commission_rulings
+                ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS archived_by_id BIGINT,
+                ADD COLUMN IF NOT EXISTS archived_by_name TEXT,
+                ADD COLUMN IF NOT EXISTS archive_channel_id BIGINT,
+                ADD COLUMN IF NOT EXISTS archive_message_id BIGINT,
+                ADD COLUMN IF NOT EXISTS action_completed_text TEXT;
+            """)
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS commission_ruling_audit (
                     id BIGSERIAL PRIMARY KEY,
@@ -656,6 +670,7 @@ CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
+COMMISSION_ARCHIVE_VERSION = "V1-COMMISSION-ARCHIVE-2026-09-13"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -842,6 +857,7 @@ async def systemcheck(ctx):
         "rulingstatus",
         "rulinghistory",
         "correctruling",
+        "archiveruling",
     ]
 
     missing_commands = []
@@ -2389,6 +2405,7 @@ OSBL_JOB_COMMAND_GUIDES = {
             "!ruling <Booking ID>",
             "!rulingstatus <Ruling ID>",
             "!rulinghistory [Booking ID]",
+            "!archiveruling <Ruling ID>",
         ],
         "commissioner_commands": [
             "!correctruling <Ruling ID>",
@@ -2734,6 +2751,7 @@ COMMISSION_RULING_CHANNELS = {
     "payout": ("payouts", "payout", "treasury"),
     "discipline": ("violations-and-reviews", "violations-reviews"),
     "supervisor": ("osbl-staff-command-center", "staff-command-center"),
+    "archive": ("staff-archive", "osbl-staff-archive"),
 }
 
 COMMISSION_RULING_ROUTE_MAP = {
@@ -3019,6 +3037,64 @@ def _build_commission_ruling_embed(row, *, corrected=False):
         inline=False,
     )
     embed.set_footer(text=f"{COMMISSION_RULING_VERSION} • ONE LEAGUE • ONE STANDARD • ONE CHAMPION")
+    return embed
+
+
+def _build_commission_archive_embed(row, action_completed_text, archived_by_name):
+    actions = _decode_ruling_actions(row["actions_json"])
+    embed = discord.Embed(
+        title="📚 ONE STATE BOXING LEAGUE — OFFICIAL CASE ARCHIVE",
+        description=(
+            f"**Ruling ID:** #{row['id']}\n"
+            f"**Booking ID:** #{row['booking_id']}\n"
+            "**Archive Status:** CASE CLOSED"
+        ),
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(
+        name="🥊 Fighters",
+        value=f"**{row['fighter1_name']}** vs **{row['fighter2_name']}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="📌 Issue",
+        value=_clip_ruling_text(row["issue_reviewed"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚖️ Final Ruling",
+        value=_clip_ruling_text(row["ruling_text"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔧 Authorized Action",
+        value="\n".join(_ruling_action_labels(actions, row["other_action_text"])),
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ Action Completed / Verified",
+        value=_clip_ruling_text(action_completed_text, 1000),
+        inline=False,
+    )
+    embed.add_field(
+        name="👑 Ruling Issued By",
+        value=f"**{row['issued_by_name']}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="📚 Archived By",
+        value=f"**{archived_by_name}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🛡️ Record Notice",
+        value=(
+            "This archive record closes the administrative case only. The FINAL ruling remains "
+            "preserved in Commission Rulings history, and its audit trail is retained."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{COMMISSION_ARCHIVE_VERSION} • ONE LEAGUE • ONE STANDARD • ONE CHAMPION")
     return embed
 
 
@@ -3656,6 +3732,165 @@ async def correctruling(ctx, ruling_id: int = None):
         f"Department flags: {route_text}"
         + warning_text
         + "\n\nThe original ruling remains preserved in the official audit history."
+    )
+
+
+@bot.command()
+async def archiveruling(ctx, ruling_id: int = None):
+    """
+    Archive a completed FINAL Commission Ruling to #staff-archive.
+    Allowed: OSBL Commissioner, or the Supervisor authorized for the ruling's booking.
+    The ruling remains FINAL; archival metadata is stored separately.
+    """
+    if ruling_id is None:
+        await ctx.send("❌ Use: `!archiveruling <Ruling ID>`")
+        return
+
+    async with bot.db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM commission_rulings WHERE id = $1",
+            ruling_id,
+        )
+    if not row:
+        await ctx.send(f"❌ Ruling **#{ruling_id}** was not found.")
+        return
+
+    if str(row["status"]).casefold() != "final":
+        await ctx.send(
+            f"🛑 Ruling **#{ruling_id}** is **{str(row['status']).upper()}** and cannot be archived.\n"
+            "Only the active FINAL ruling may be archived."
+        )
+        return
+
+    if row["archived_at"] is not None:
+        await ctx.send(
+            f"📚 Ruling **#{ruling_id}** is already archived.\n"
+            f"Archived by **{row['archived_by_name'] or 'OSBL Staff'}**."
+        )
+        return
+
+    booking = await _fetch_ruling_booking(row["booking_id"])
+    if booking:
+        allowed, denial = await _can_issue_commission_ruling(ctx, booking)
+        if not allowed:
+            await ctx.send(denial)
+            return
+    else:
+        role_names = {role.name for role in getattr(ctx.author, "roles", [])}
+        if "OSBL COMMISSIONER" not in role_names:
+            await ctx.send(
+                "🛑 The original booking is unavailable. Only the **OSBL COMMISSIONER** may archive this ruling."
+            )
+            return
+
+    archive_channel = _find_osbl_text_channel(ctx.guild, "archive")
+    if archive_channel is None:
+        await ctx.send(
+            "❌ **#staff-archive NOT FOUND**\n"
+            "Create or restore the staff-only channel named `staff-archive`, then run this command again."
+        )
+        return
+
+    await ctx.send(
+        "📚 **OSBL CASE ARCHIVE WORKFLOW**\n"
+        f"Ruling: **#{row['id']}** • Booking: **#{row['booking_id']}**\n"
+        f"Fight: **{row['fighter1_name']} vs {row['fighter2_name']}**\n\n"
+        "Before closing the case, confirm what authorized action was actually completed and verified."
+    )
+
+    action_completed = await _wait_for_staff_reply(
+        ctx,
+        (
+            "✅ **ACTION COMPLETED / VERIFIED**\n"
+            "Enter a short completion summary. Example: `Result updated to draw and rematch returned to Matchmaking.`\n"
+            "If no operational change was required, enter `NO CHANGE REQUIRED`."
+        ),
+        max_chars=1000,
+    )
+    if action_completed is None:
+        return
+
+    preview = _build_commission_archive_embed(row, action_completed, ctx.author.display_name)
+    await ctx.send("🔎 **ARCHIVE PREVIEW — NOTHING CLOSED YET**", embed=preview)
+
+    confirmation = await _wait_for_staff_reply(
+        ctx,
+        "Type **`CONFIRM ARCHIVE`** to close and archive this case, or `CANCEL`.",
+        max_chars=50,
+    )
+    if confirmation is None:
+        return
+    if confirmation.casefold() != "confirm archive":
+        await ctx.send("❌ Confirmation did not match `CONFIRM ARCHIVE`. The case remains open.")
+        return
+
+    # Re-check inside a transaction so two staff members cannot archive the same case simultaneously.
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow(
+                "SELECT * FROM commission_rulings WHERE id = $1 FOR UPDATE",
+                ruling_id,
+            )
+            if current["archived_at"] is not None:
+                await ctx.send(f"📚 Ruling **#{ruling_id}** was already archived while this workflow was open.")
+                return
+            if str(current["status"]).casefold() != "final":
+                await ctx.send("🛑 The ruling changed while this archive workflow was open. Review its status and try again.")
+                return
+
+            archive_embed = _build_commission_archive_embed(current, action_completed, ctx.author.display_name)
+            try:
+                archive_message = await archive_channel.send(embed=archive_embed)
+            except Exception as exc:
+                print(f"Commission archive post error: {type(exc).__name__}: {exc}")
+                await ctx.send(
+                    "❌ **ARCHIVE POST FAILED**\n"
+                    "The ruling remains FINAL and unarchived. Check the bot's View Channel / Send Messages / "
+                    "Embed Links permissions in `#staff-archive`, then run the command again."
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE commission_rulings
+                SET archived_at = NOW(),
+                    archived_by_id = $2,
+                    archived_by_name = $3,
+                    archive_channel_id = $4,
+                    archive_message_id = $5,
+                    action_completed_text = $6
+                WHERE id = $1
+                """,
+                ruling_id,
+                ctx.author.id,
+                ctx.author.display_name,
+                archive_channel.id,
+                archive_message.id,
+                action_completed,
+            )
+            await conn.execute(
+                """
+                INSERT INTO commission_ruling_audit (
+                    ruling_id, booking_id, event_type, actor_id, actor_name, details_json
+                ) VALUES ($1, $2, 'ARCHIVED', $3, $4, $5)
+                """,
+                ruling_id,
+                current["booking_id"],
+                ctx.author.id,
+                ctx.author.display_name,
+                json.dumps({
+                    "action_completed": action_completed,
+                    "archive_channel_id": archive_channel.id,
+                    "archive_message_id": archive_message.id,
+                }),
+            )
+
+    await ctx.send(
+        "✅ **OSBL CASE ARCHIVED**\n"
+        f"Ruling ID: **#{ruling_id}**\n"
+        f"Booking ID: **#{row['booking_id']}**\n"
+        f"Archive posted in **#{archive_channel.name}**.\n"
+        "The FINAL ruling remains preserved, and the private review ticket is now ready to be closed/transcripted."
     )
 
 
