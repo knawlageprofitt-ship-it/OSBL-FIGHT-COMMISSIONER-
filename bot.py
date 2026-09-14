@@ -507,6 +507,139 @@ class OSBLBot(commands.Bot):
                 ON commission_ruling_audit (booking_id, id DESC);
             """)
 
+
+
+            # =====================================================
+            # OSBL SPORTSBOOK — PREPAID IN-GAME WALLET SYSTEM
+            # =====================================================
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sportsbook_wallets (
+                    discord_user_id BIGINT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    available_balance BIGINT NOT NULL DEFAULT 0,
+                    locked_balance BIGINT NOT NULL DEFAULT 0,
+                    pending_withdrawal BIGINT NOT NULL DEFAULT 0,
+                    total_deposited BIGINT NOT NULL DEFAULT 0,
+                    total_withdrawn BIGINT NOT NULL DEFAULT 0,
+                    total_wagered BIGINT NOT NULL DEFAULT 0,
+                    net_profit BIGINT NOT NULL DEFAULT 0,
+                    wins INTEGER NOT NULL DEFAULT 0,
+                    losses INTEGER NOT NULL DEFAULT 0,
+                    refunds INTEGER NOT NULL DEFAULT 0,
+                    largest_win BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CHECK (available_balance >= 0),
+                    CHECK (locked_balance >= 0),
+                    CHECK (pending_withdrawal >= 0)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sportsbook_bank_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_user_id BIGINT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    request_type TEXT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    processed_by_id BIGINT,
+                    processed_by_name TEXT,
+                    processed_at TIMESTAMPTZ,
+                    note TEXT,
+                    CHECK (request_type IN ('deposit', 'withdrawal')),
+                    CHECK (amount > 0)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS sportsbook_bank_requests_status_idx
+                ON sportsbook_bank_requests (status, request_type, id);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sportsbook_markets (
+                    booking_id BIGINT PRIMARY KEY,
+                    fighter1_key TEXT NOT NULL,
+                    fighter1_name TEXT NOT NULL,
+                    fighter2_key TEXT NOT NULL,
+                    fighter2_name TEXT NOT NULL,
+                    division TEXT NOT NULL,
+                    bout_type TEXT NOT NULL,
+                    fight_night_session_id BIGINT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    opened_by_id BIGINT NOT NULL,
+                    opened_by_name TEXT NOT NULL,
+                    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    locked_by_id BIGINT,
+                    locked_by_name TEXT,
+                    locked_at TIMESTAMPTZ,
+                    settled_by_id BIGINT,
+                    settled_by_name TEXT,
+                    settled_at TIMESTAMPTZ,
+                    winner_key TEXT,
+                    winner_name TEXT,
+                    result_history_id BIGINT,
+                    status_note TEXT
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS sportsbook_markets_status_idx
+                ON sportsbook_markets (status, booking_id);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sportsbook_bets (
+                    id BIGSERIAL PRIMARY KEY,
+                    booking_id BIGINT NOT NULL,
+                    discord_user_id BIGINT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    fighter_key TEXT NOT NULL,
+                    fighter_name TEXT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    payout_amount BIGINT NOT NULL DEFAULT 0,
+                    profit_amount BIGINT NOT NULL DEFAULT 0,
+                    placed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    settled_at TIMESTAMPTZ,
+                    UNIQUE (booking_id, discord_user_id),
+                    CHECK (amount > 0)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS sportsbook_bets_user_idx
+                ON sportsbook_bets (discord_user_id, status, id DESC);
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS sportsbook_bets_booking_idx
+                ON sportsbook_bets (booking_id, status, id);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sportsbook_audit (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    discord_user_id BIGINT,
+                    display_name TEXT,
+                    booking_id BIGINT,
+                    amount BIGINT,
+                    actor_id BIGINT,
+                    actor_name TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS sportsbook_audit_idx
+                ON sportsbook_audit (id DESC, event_type);
+            """)
+
             default_gyms = [
                 ("RADEEMERS", "Dub Radeem"),
                 ("ROYAL HITTAZ", "Stormi North"),
@@ -671,6 +804,7 @@ DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
 COMMISSION_ARCHIVE_VERSION = "V1-COMMISSION-ARCHIVE-2026-09-13"
+SPORTSBOOK_SYSTEM_VERSION = "V1-PREPAID-SPORTSBOOK-2026-09-14"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -703,6 +837,11 @@ async def systemcheck(ctx):
         "fighter_discord_links",
         "commission_rulings",
         "commission_ruling_audit",
+        "sportsbook_wallets",
+        "sportsbook_bank_requests",
+        "sportsbook_markets",
+        "sportsbook_bets",
+        "sportsbook_audit",
     ]
 
     try:
@@ -858,6 +997,23 @@ async def systemcheck(ctx):
         "rulinghistory",
         "correctruling",
         "archiveruling",
+        "sportsbook",
+        "bettingbalance",
+        "mybets",
+        "betdeposit",
+        "betwithdraw",
+        "bet",
+        "bettingboard",
+        "bettingrequests",
+        "confirmbetdeposit",
+        "confirmbetwithdraw",
+        "rejectbetrequest",
+        "openbetting",
+        "lockbets",
+        "holdbets",
+        "settlebets",
+        "voidbets",
+        "bettingaudit",
     ]
 
     missing_commands = []
@@ -1006,6 +1162,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🧹 Fight Night Cleanup",
         value=f"**{FIGHT_NIGHT_CLEANUP_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎰 Sportsbook System",
+        value=f"**{SPORTSBOOK_SYSTEM_VERSION}**",
         inline=False,
     )
 
@@ -10437,6 +10599,1092 @@ async def databasebackup(ctx):
                     "Temporary backup cleanup warning: "
                     f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                 )
+
+
+
+
+# =========================================================
+# OSBL SPORTSBOOK — PREPAID / NO-DEBT BETTING SYSTEM
+# In-game funds only. No real-money handling by this bot.
+# Maximum wager per fight: $10,000,000.
+# Straight 1-for-1 profit: winning return = 2x stake.
+# =========================================================
+
+SPORTSBOOK_MAX_WAGER = 10_000_000
+SPORTSBOOK_CHANNEL = "sportsbook-desk"
+SPORTSBOOK_BANK_CHANNEL = "sportsbook-bank"
+SPORTSBOOK_RESULTS_CHANNEL = "betting-results"
+SPORTSBOOK_LEADERBOARD_CHANNEL = "betting-leaderboard"
+SPORTSBOOK_OPERATIONS_CHANNEL = "sportsbook-operations"
+
+
+def _sportsbook_money(value):
+    return f"${int(value or 0):,}"
+
+
+def _parse_sportsbook_amount(raw):
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().replace(",", "").replace("$", "")
+    multipliers = {"k": 1_000, "m": 1_000_000}
+    if cleaned and cleaned[-1:].lower() in multipliers:
+        suffix = cleaned[-1:].lower()
+        try:
+            return int(float(cleaned[:-1]) * multipliers[suffix])
+        except Exception:
+            return None
+    try:
+        return int(cleaned)
+    except Exception:
+        return None
+
+
+async def _sportsbook_wallet(conn, user):
+    await conn.execute(
+        """
+        INSERT INTO sportsbook_wallets (discord_user_id, display_name)
+        VALUES ($1, $2)
+        ON CONFLICT (discord_user_id)
+        DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = NOW()
+        """,
+        user.id,
+        user.display_name,
+    )
+    return await conn.fetchrow(
+        "SELECT * FROM sportsbook_wallets WHERE discord_user_id = $1",
+        user.id,
+    )
+
+
+def _sportsbook_channel(guild, name):
+    if guild is None:
+        return None
+    return discord.utils.get(guild.text_channels, name=name)
+
+
+async def _sportsbook_post(guild, channel_name, *, content=None, embed=None):
+    channel = _sportsbook_channel(guild, channel_name)
+    if channel is None:
+        return False
+    try:
+        await channel.send(content=content, embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def _sportsbook_is_bout_participant(conn, user_id, market):
+    linked_key = await conn.fetchval(
+        "SELECT fighter_key FROM fighter_discord_links WHERE discord_user_id = $1",
+        user_id,
+    )
+    return linked_key in {market["fighter1_key"], market["fighter2_key"]}
+
+
+async def _sportsbook_is_assigned_staff(conn, user_id, market):
+    session_id = market["fight_night_session_id"]
+    if not session_id:
+        return False
+    return bool(await conn.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1 FROM fight_night_staff_assignments
+            WHERE session_id = $1 AND staff_user_id = $2
+        )
+        """,
+        session_id,
+        user_id,
+    ))
+
+
+async def _sportsbook_refund_market(conn, booking_id, actor, reason):
+    rows = await conn.fetch(
+        """
+        SELECT * FROM sportsbook_bets
+        WHERE booking_id = $1 AND status IN ('open', 'locked', 'held')
+        ORDER BY id
+        FOR UPDATE
+        """,
+        booking_id,
+    )
+    total = 0
+    for row in rows:
+        amount = int(row["amount"])
+        total += amount
+        await conn.execute(
+            """
+            UPDATE sportsbook_wallets
+            SET available_balance = available_balance + $1,
+                locked_balance = GREATEST(locked_balance - $1, 0),
+                refunds = refunds + 1,
+                updated_at = NOW()
+            WHERE discord_user_id = $2
+            """,
+            amount,
+            row["discord_user_id"],
+        )
+        await conn.execute(
+            """
+            UPDATE sportsbook_bets
+            SET status = 'refunded', payout_amount = $1, profit_amount = 0,
+                settled_at = NOW(), updated_at = NOW()
+            WHERE id = $2
+            """,
+            amount,
+            row["id"],
+        )
+    await conn.execute(
+        """
+        UPDATE sportsbook_markets
+        SET status = 'void', status_note = $2,
+            settled_by_id = $3, settled_by_name = $4, settled_at = NOW()
+        WHERE booking_id = $1
+        """,
+        booking_id,
+        reason,
+        actor.id,
+        actor.display_name,
+    )
+    await conn.execute(
+        """
+        INSERT INTO sportsbook_audit
+            (event_type, booking_id, amount, actor_id, actor_name, details_json)
+        VALUES ('MARKET_REFUND', $1, $2, $3, $4, $5)
+        """,
+        booking_id,
+        total,
+        actor.id,
+        actor.display_name,
+        json.dumps({"reason": reason, "bet_count": len(rows)}),
+    )
+    return len(rows), total
+
+
+@bot.command()
+async def bettingbalance(ctx):
+    async with bot.db.acquire() as conn:
+        wallet = await _sportsbook_wallet(conn, ctx.author)
+    total = int(wallet["available_balance"]) + int(wallet["locked_balance"]) + int(wallet["pending_withdrawal"])
+    embed = discord.Embed(title="💰 OSBL SPORTSBOOK WALLET", color=discord.Color.gold())
+    embed.add_field(name="Available", value=f"**{_sportsbook_money(wallet['available_balance'])}**", inline=True)
+    embed.add_field(name="Locked in Bets", value=f"**{_sportsbook_money(wallet['locked_balance'])}**", inline=True)
+    embed.add_field(name="Pending Withdrawal", value=f"**{_sportsbook_money(wallet['pending_withdrawal'])}**", inline=True)
+    embed.add_field(name="Total Wallet", value=f"**{_sportsbook_money(total)}**", inline=False)
+    embed.add_field(name="Lifetime Net Profit", value=f"**{_sportsbook_money(wallet['net_profit'])}**", inline=True)
+    embed.add_field(name="Record", value=f"**{wallet['wins']} W - {wallet['losses']} L**", inline=True)
+    embed.set_footer(text=f"Maximum wager per fight: {_sportsbook_money(SPORTSBOOK_MAX_WAGER)} • No credit • No debt")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def betdeposit(ctx, amount: str = None):
+    amount_value = _parse_sportsbook_amount(amount)
+    if not amount_value or amount_value <= 0:
+        await ctx.send("❌ Use: `!betdeposit <Amount>`\nExample: `!betdeposit 5000000`")
+        return
+    async with bot.db.acquire() as conn:
+        await _sportsbook_wallet(conn, ctx.author)
+        existing = await conn.fetchrow(
+            """
+            SELECT id, amount FROM sportsbook_bank_requests
+            WHERE discord_user_id = $1 AND request_type = 'deposit' AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            ctx.author.id,
+        )
+        if existing:
+            await ctx.send(f"⚠️ You already have pending Deposit Request **#{existing['id']}** for **{_sportsbook_money(existing['amount'])}**.")
+            return
+        request_id = await conn.fetchval(
+            """
+            INSERT INTO sportsbook_bank_requests
+                (discord_user_id, display_name, request_type, amount)
+            VALUES ($1,$2,'deposit',$3)
+            RETURNING id
+            """,
+            ctx.author.id,
+            ctx.author.display_name,
+            amount_value,
+        )
+        await conn.execute(
+            """
+            INSERT INTO sportsbook_audit
+                (event_type, discord_user_id, display_name, amount, actor_id, actor_name)
+            VALUES ('DEPOSIT_REQUESTED',$1,$2,$3,$1,$2)
+            """,
+            ctx.author.id,
+            ctx.author.display_name,
+            amount_value,
+        )
+    await ctx.send(
+        f"🏦 **OSBL SPORTSBOOK DEPOSIT REQUEST #{request_id}**\n"
+        f"Amount: **{_sportsbook_money(amount_value)}**\n\n"
+        "Transfer the matching in-game amount to the authorized OSBL Sportsbook holder. "
+        "Your wallet will not be credited until staff verifies the in-game transfer."
+    )
+
+
+@bot.command()
+async def betwithdraw(ctx, amount: str = None):
+    amount_value = _parse_sportsbook_amount(amount)
+    if not amount_value or amount_value <= 0:
+        await ctx.send("❌ Use: `!betwithdraw <Amount>`\nExample: `!betwithdraw 2000000`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            wallet = await _sportsbook_wallet(conn, ctx.author)
+            wallet = await conn.fetchrow(
+                "SELECT * FROM sportsbook_wallets WHERE discord_user_id = $1 FOR UPDATE",
+                ctx.author.id,
+            )
+            if int(wallet["available_balance"]) < amount_value:
+                await ctx.send(
+                    "❌ **INSUFFICIENT AVAILABLE FUNDS**\n"
+                    f"Available: **{_sportsbook_money(wallet['available_balance'])}**\n"
+                    f"Requested: **{_sportsbook_money(amount_value)}**"
+                )
+                return
+            existing = await conn.fetchrow(
+                """
+                SELECT id, amount FROM sportsbook_bank_requests
+                WHERE discord_user_id = $1 AND request_type = 'withdrawal' AND status = 'pending'
+                ORDER BY id DESC LIMIT 1
+                """,
+                ctx.author.id,
+            )
+            if existing:
+                await ctx.send(f"⚠️ You already have pending Withdrawal Request **#{existing['id']}**.")
+                return
+            request_id = await conn.fetchval(
+                """
+                INSERT INTO sportsbook_bank_requests
+                    (discord_user_id, display_name, request_type, amount)
+                VALUES ($1,$2,'withdrawal',$3)
+                RETURNING id
+                """,
+                ctx.author.id,
+                ctx.author.display_name,
+                amount_value,
+            )
+            await conn.execute(
+                """
+                UPDATE sportsbook_wallets
+                SET available_balance = available_balance - $1,
+                    pending_withdrawal = pending_withdrawal + $1,
+                    updated_at = NOW()
+                WHERE discord_user_id = $2
+                """,
+                amount_value,
+                ctx.author.id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit
+                    (event_type, discord_user_id, display_name, amount, actor_id, actor_name)
+                VALUES ('WITHDRAWAL_REQUESTED',$1,$2,$3,$1,$2)
+                """,
+                ctx.author.id,
+                ctx.author.display_name,
+                amount_value,
+            )
+    await ctx.send(
+        f"💸 **OSBL SPORTSBOOK WITHDRAWAL REQUEST #{request_id}**\n"
+        f"Amount: **{_sportsbook_money(amount_value)}**\n"
+        "Those funds are now locked from betting until authorized staff completes or rejects the request."
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def bettingrequests(ctx):
+    async with bot.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM sportsbook_bank_requests
+            WHERE status = 'pending'
+            ORDER BY id ASC
+            LIMIT 30
+            """
+        )
+    if not rows:
+        await ctx.send("✅ There are no pending sportsbook bank requests.")
+        return
+    lines = [
+        f"**#{r['id']}** • {r['request_type'].upper()} • **{r['display_name']}** • **{_sportsbook_money(r['amount'])}**"
+        for r in rows
+    ]
+    embed = discord.Embed(title="🏦 OSBL SPORTSBOOK BANK REQUESTS", description="\n".join(lines), color=discord.Color.gold())
+    embed.set_footer(text="Verify the in-game transaction before confirming any request.")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def confirmbetdeposit(ctx, request_id: int = None):
+    if request_id is None:
+        await ctx.send("❌ Use: `!confirmbetdeposit <Request ID>`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            request = await conn.fetchrow(
+                "SELECT * FROM sportsbook_bank_requests WHERE id = $1 FOR UPDATE",
+                request_id,
+            )
+            if not request or request["request_type"] != "deposit":
+                await ctx.send("❌ Deposit request not found.")
+                return
+            if request["status"] != "pending":
+                await ctx.send(f"⚠️ Request #{request_id} is already **{request['status']}**.")
+                return
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_wallets (discord_user_id, display_name, available_balance, total_deposited)
+                VALUES ($1,$2,$3,$3)
+                ON CONFLICT (discord_user_id) DO UPDATE
+                SET display_name = EXCLUDED.display_name,
+                    available_balance = sportsbook_wallets.available_balance + EXCLUDED.available_balance,
+                    total_deposited = sportsbook_wallets.total_deposited + EXCLUDED.total_deposited,
+                    updated_at = NOW()
+                """,
+                request["discord_user_id"], request["display_name"], request["amount"],
+            )
+            await conn.execute(
+                """
+                UPDATE sportsbook_bank_requests
+                SET status='confirmed', processed_by_id=$2, processed_by_name=$3, processed_at=NOW()
+                WHERE id=$1
+                """,
+                request_id, ctx.author.id, ctx.author.display_name,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit
+                    (event_type, discord_user_id, display_name, amount, actor_id, actor_name, details_json)
+                VALUES ('DEPOSIT_CONFIRMED',$1,$2,$3,$4,$5,$6)
+                """,
+                request["discord_user_id"], request["display_name"], request["amount"],
+                ctx.author.id, ctx.author.display_name, json.dumps({"request_id": request_id}),
+            )
+            balance = await conn.fetchval(
+                "SELECT available_balance FROM sportsbook_wallets WHERE discord_user_id=$1",
+                request["discord_user_id"],
+            )
+    await ctx.send(
+        f"✅ **DEPOSIT CONFIRMED — REQUEST #{request_id}**\n"
+        f"Player: **{request['display_name']}**\n"
+        f"Credited: **{_sportsbook_money(request['amount'])}**\n"
+        f"Available Balance: **{_sportsbook_money(balance)}**"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def confirmbetwithdraw(ctx, request_id: int = None):
+    if request_id is None:
+        await ctx.send("❌ Use: `!confirmbetwithdraw <Request ID>`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            request = await conn.fetchrow("SELECT * FROM sportsbook_bank_requests WHERE id=$1 FOR UPDATE", request_id)
+            if not request or request["request_type"] != "withdrawal":
+                await ctx.send("❌ Withdrawal request not found.")
+                return
+            if request["status"] != "pending":
+                await ctx.send(f"⚠️ Request #{request_id} is already **{request['status']}**.")
+                return
+            wallet = await conn.fetchrow(
+                "SELECT * FROM sportsbook_wallets WHERE discord_user_id=$1 FOR UPDATE",
+                request["discord_user_id"],
+            )
+            if not wallet or int(wallet["pending_withdrawal"]) < int(request["amount"]):
+                await ctx.send("❌ Wallet pending-withdrawal balance does not match this request. No changes made.")
+                return
+            await conn.execute(
+                """
+                UPDATE sportsbook_wallets
+                SET pending_withdrawal = pending_withdrawal - $1,
+                    total_withdrawn = total_withdrawn + $1,
+                    updated_at = NOW()
+                WHERE discord_user_id = $2
+                """,
+                request["amount"], request["discord_user_id"],
+            )
+            await conn.execute(
+                """
+                UPDATE sportsbook_bank_requests
+                SET status='confirmed', processed_by_id=$2, processed_by_name=$3, processed_at=NOW()
+                WHERE id=$1
+                """,
+                request_id, ctx.author.id, ctx.author.display_name,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit
+                    (event_type, discord_user_id, display_name, amount, actor_id, actor_name, details_json)
+                VALUES ('WITHDRAWAL_CONFIRMED',$1,$2,$3,$4,$5,$6)
+                """,
+                request["discord_user_id"], request["display_name"], request["amount"],
+                ctx.author.id, ctx.author.display_name, json.dumps({"request_id": request_id}),
+            )
+    await ctx.send(
+        f"✅ **WITHDRAWAL CONFIRMED — REQUEST #{request_id}**\n"
+        f"Player: **{request['display_name']}**\n"
+        f"Paid in-game: **{_sportsbook_money(request['amount'])}**"
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def rejectbetrequest(ctx, request_id: int = None, *, reason: str = "Not approved"):
+    if request_id is None:
+        await ctx.send("❌ Use: `!rejectbetrequest <Request ID> [reason]`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            request = await conn.fetchrow("SELECT * FROM sportsbook_bank_requests WHERE id=$1 FOR UPDATE", request_id)
+            if not request:
+                await ctx.send("❌ Sportsbook bank request not found.")
+                return
+            if request["status"] != "pending":
+                await ctx.send(f"⚠️ Request #{request_id} is already **{request['status']}**.")
+                return
+            if request["request_type"] == "withdrawal":
+                await conn.execute(
+                    """
+                    UPDATE sportsbook_wallets
+                    SET pending_withdrawal = GREATEST(pending_withdrawal - $1, 0),
+                        available_balance = available_balance + $1,
+                        updated_at = NOW()
+                    WHERE discord_user_id=$2
+                    """,
+                    request["amount"], request["discord_user_id"],
+                )
+            await conn.execute(
+                """
+                UPDATE sportsbook_bank_requests
+                SET status='rejected', processed_by_id=$2, processed_by_name=$3,
+                    processed_at=NOW(), note=$4
+                WHERE id=$1
+                """,
+                request_id, ctx.author.id, ctx.author.display_name, reason,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit
+                    (event_type, discord_user_id, display_name, amount, actor_id, actor_name, details_json)
+                VALUES ('BANK_REQUEST_REJECTED',$1,$2,$3,$4,$5,$6)
+                """,
+                request["discord_user_id"], request["display_name"], request["amount"],
+                ctx.author.id, ctx.author.display_name,
+                json.dumps({"request_id": request_id, "type": request["request_type"], "reason": reason}),
+            )
+    await ctx.send(f"🛑 Sportsbook Request **#{request_id}** rejected. Reason: **{reason}**")
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def openbetting(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use: `!openbetting <Booking ID>`")
+        return
+    async with bot.db.acquire() as conn:
+        booking = await conn.fetchrow("SELECT * FROM fight_bookings WHERE id=$1", booking_id)
+        if not booking:
+            await ctx.send("❌ Booking not found.")
+            return
+        if booking["status"] != "locked":
+            await ctx.send(
+                f"❌ Booking #{booking_id} must be **LOCKED** before betting can open. Current status: **{booking['status']}**."
+            )
+            return
+        existing = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1", booking_id)
+        if existing and existing["status"] not in ("void", "settled"):
+            await ctx.send(f"⚠️ Betting for Booking #{booking_id} is already **{existing['status'].upper()}**.")
+            return
+        if existing:
+            await conn.execute(
+                """
+                UPDATE sportsbook_markets
+                SET fighter1_key=$2, fighter1_name=$3, fighter2_key=$4, fighter2_name=$5,
+                    division=$6, bout_type=$7, fight_night_session_id=$8,
+                    status='open', opened_by_id=$9, opened_by_name=$10, opened_at=NOW(),
+                    locked_by_id=NULL, locked_by_name=NULL, locked_at=NULL,
+                    settled_by_id=NULL, settled_by_name=NULL, settled_at=NULL,
+                    winner_key=NULL, winner_name=NULL, result_history_id=NULL, status_note=NULL
+                WHERE booking_id=$1
+                """,
+                booking_id, booking["fighter1_key"], booking["fighter1_name"],
+                booking["fighter2_key"], booking["fighter2_name"], booking["division"],
+                booking["bout_type"], booking["fight_night_session_id"], ctx.author.id, ctx.author.display_name,
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_markets
+                    (booking_id, fighter1_key, fighter1_name, fighter2_key, fighter2_name,
+                     division, bout_type, fight_night_session_id, status, opened_by_id, opened_by_name)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10)
+                """,
+                booking_id, booking["fighter1_key"], booking["fighter1_name"],
+                booking["fighter2_key"], booking["fighter2_name"], booking["division"],
+                booking["bout_type"], booking["fight_night_session_id"], ctx.author.id, ctx.author.display_name,
+            )
+        await conn.execute(
+            """
+            INSERT INTO sportsbook_audit (event_type, booking_id, actor_id, actor_name, details_json)
+            VALUES ('MARKET_OPENED',$1,$2,$3,$4)
+            """,
+            booking_id, ctx.author.id, ctx.author.display_name,
+            json.dumps({"fighter1": booking["fighter1_name"], "fighter2": booking["fighter2_name"]}),
+        )
+    embed = discord.Embed(title="🎰 OSBL BETTING IS OPEN", color=discord.Color.gold())
+    embed.description = (
+        f"**Booking #{booking_id}**\n"
+        f"🥊 **{booking['fighter1_name']}** vs **{booking['fighter2_name']}**\n"
+        f"Division: **{booking['division']}** • Bout: **{str(booking['bout_type']).title()}**\n\n"
+        f"Maximum wager: **{_sportsbook_money(SPORTSBOOK_MAX_WAGER)}**\n"
+        "Winning bets pay **1-for-1 profit + original stake**."
+    )
+    embed.add_field(name="Place Your Bet", value=f"`!bet {booking_id} Fighter Name Amount`", inline=False)
+    posted = await _sportsbook_post(ctx.guild, SPORTSBOOK_CHANNEL, embed=embed)
+    await ctx.send(f"✅ Betting opened for Booking **#{booking_id}**." + ("" if posted else " ⚠️ Could not post to #sportsbook-desk."))
+
+
+@bot.command()
+async def sportsbook(ctx):
+    async with bot.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT m.*,
+                   COALESCE(SUM(b.amount),0)::BIGINT AS total_handle,
+                   COUNT(b.id)::INT AS bet_count
+            FROM sportsbook_markets m
+            LEFT JOIN sportsbook_bets b ON b.booking_id=m.booking_id AND b.status IN ('open','locked','held')
+            WHERE m.status IN ('open','locked','held')
+            GROUP BY m.booking_id
+            ORDER BY m.booking_id ASC
+            """
+        )
+    if not rows:
+        await ctx.send("🎰 There are currently no active OSBL sportsbook markets.")
+        return
+    embed = discord.Embed(title="🎰 OSBL SPORTSBOOK BOARD", color=discord.Color.gold())
+    for r in rows[:15]:
+        icon = "🟢" if r["status"] == "open" else ("🟡" if r["status"] == "held" else "🔒")
+        embed.add_field(
+            name=f"{icon} Booking #{r['booking_id']} — {str(r['status']).upper()}",
+            value=(
+                f"**{r['fighter1_name']}** vs **{r['fighter2_name']}**\n"
+                f"{r['division']} • {str(r['bout_type']).title()}\n"
+                f"Bets: **{r['bet_count']}** • Handle: **{_sportsbook_money(r['total_handle'])}**"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="No odds • No credit • Maximum $10,000,000 per fight")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def bet(ctx, booking_id: int = None, *, details: str = None):
+    if booking_id is None or not details:
+        await ctx.send("❌ Use: `!bet <Booking ID> <Fighter Name> <Amount>`\nExample: `!bet 14 HELLO KITTY 2000000`")
+        return
+    match = re.match(r"^(.+?)\s+([$]?[0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)$", details.strip())
+    if not match:
+        await ctx.send("❌ Use: `!bet <Booking ID> <Fighter Name> <Amount>`")
+        return
+    fighter_input = match.group(1).strip()
+    amount_value = _parse_sportsbook_amount(match.group(2))
+    if not amount_value or amount_value <= 0:
+        await ctx.send("❌ Wager amount must be greater than $0.")
+        return
+    if amount_value > SPORTSBOOK_MAX_WAGER:
+        await ctx.send(f"❌ Maximum wager per fight is **{_sportsbook_money(SPORTSBOOK_MAX_WAGER)}**.")
+        return
+
+    async with bot.db.acquire() as conn:
+        market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1", booking_id)
+        if not market or market["status"] != "open":
+            await ctx.send("❌ Betting for that Booking ID is not currently open.")
+            return
+        fighter_norm = fighter_input.casefold().strip()
+        choices = {
+            market["fighter1_name"].casefold(): (market["fighter1_key"], market["fighter1_name"]),
+            market["fighter2_name"].casefold(): (market["fighter2_key"], market["fighter2_name"]),
+        }
+        pick = choices.get(fighter_norm)
+        if not pick:
+            await ctx.send(
+                f"❌ Pick either **{market['fighter1_name']}** or **{market['fighter2_name']}** exactly."
+            )
+            return
+        if await _sportsbook_is_bout_participant(conn, ctx.author.id, market):
+            await ctx.send("⛔ Fighters cannot bet on their own fight.")
+            return
+        if await _sportsbook_is_assigned_staff(conn, ctx.author.id, market):
+            await ctx.send("⛔ Staff assigned to this Fight Night cannot wager on this bout.")
+            return
+        wallet = await _sportsbook_wallet(conn, ctx.author)
+        existing = await conn.fetchrow(
+            "SELECT * FROM sportsbook_bets WHERE booking_id=$1 AND discord_user_id=$2",
+            booking_id, ctx.author.id,
+        )
+        current_amount = int(existing["amount"]) if existing else 0
+        if existing and existing["fighter_key"] != pick[0]:
+            await ctx.send("❌ You already backed the other fighter on this bout. You cannot switch sides.")
+            return
+        if existing and existing["status"] != "open":
+            await ctx.send("❌ Your existing wager is already locked or settled and cannot be changed.")
+            return
+        if current_amount + amount_value > SPORTSBOOK_MAX_WAGER:
+            await ctx.send(
+                f"❌ Your total wager on this fight cannot exceed **{_sportsbook_money(SPORTSBOOK_MAX_WAGER)}**.\n"
+                f"Already wagered: **{_sportsbook_money(current_amount)}**"
+            )
+            return
+        if int(wallet["available_balance"]) < amount_value:
+            await ctx.send(
+                "❌ **INSUFFICIENT BETTING FUNDS**\n"
+                f"Available: **{_sportsbook_money(wallet['available_balance'])}**\n"
+                f"Requested Bet: **{_sportsbook_money(amount_value)}**\n"
+                "You cannot wager money that has not been deposited."
+            )
+            return
+
+    new_total = current_amount + amount_value
+    preview = discord.Embed(title="🎟️ OSBL BET SLIP — PREVIEW", color=discord.Color.gold())
+    preview.description = (
+        f"Booking: **#{booking_id}**\n"
+        f"Pick: **{pick[1]}**\n"
+        f"New Amount: **{_sportsbook_money(amount_value)}**\n"
+        f"Total Wager on Fight: **{_sportsbook_money(new_total)}**\n\n"
+        f"If your fighter wins:\n"
+        f"Stake Returned: **{_sportsbook_money(new_total)}**\n"
+        f"Profit: **{_sportsbook_money(new_total)}**\n"
+        f"TOTAL RETURN: **{_sportsbook_money(new_total * 2)}**\n\n"
+        "Type **CONFIRM BET** to lock this wager, or **CANCEL**."
+    )
+    await ctx.send(embed=preview)
+
+    def check(m):
+        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+    try:
+        reply = await bot.wait_for("message", timeout=60.0, check=check)
+    except asyncio.TimeoutError:
+        await ctx.send("⌛ Bet preview expired. No funds were moved.")
+        return
+    answer = reply.content.strip().upper()
+    if answer != "CONFIRM BET":
+        await ctx.send("🛑 Bet canceled. No funds were moved.")
+        return
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1 FOR UPDATE", booking_id)
+            if not market or market["status"] != "open":
+                await ctx.send("❌ Betting closed before confirmation. No funds were moved.")
+                return
+            wallet = await conn.fetchrow(
+                "SELECT * FROM sportsbook_wallets WHERE discord_user_id=$1 FOR UPDATE",
+                ctx.author.id,
+            )
+            if not wallet or int(wallet["available_balance"]) < amount_value:
+                await ctx.send("❌ Your available balance changed before confirmation. No bet was placed.")
+                return
+            existing = await conn.fetchrow(
+                "SELECT * FROM sportsbook_bets WHERE booking_id=$1 AND discord_user_id=$2 FOR UPDATE",
+                booking_id, ctx.author.id,
+            )
+            if existing:
+                if existing["fighter_key"] != pick[0] or existing["status"] != "open":
+                    await ctx.send("❌ Your bet state changed before confirmation. No additional funds were moved.")
+                    return
+                if int(existing["amount"]) + amount_value > SPORTSBOOK_MAX_WAGER:
+                    await ctx.send("❌ This increase would exceed the maximum wager. No funds were moved.")
+                    return
+                bet_id = existing["id"]
+                await conn.execute(
+                    "UPDATE sportsbook_bets SET amount=amount+$1, updated_at=NOW() WHERE id=$2",
+                    amount_value, bet_id,
+                )
+            else:
+                bet_id = await conn.fetchval(
+                    """
+                    INSERT INTO sportsbook_bets
+                        (booking_id, discord_user_id, display_name, fighter_key, fighter_name, amount)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                    RETURNING id
+                    """,
+                    booking_id, ctx.author.id, ctx.author.display_name, pick[0], pick[1], amount_value,
+                )
+            await conn.execute(
+                """
+                UPDATE sportsbook_wallets
+                SET available_balance=available_balance-$1,
+                    locked_balance=locked_balance+$1,
+                    total_wagered=total_wagered+$1,
+                    updated_at=NOW()
+                WHERE discord_user_id=$2
+                """,
+                amount_value, ctx.author.id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit
+                    (event_type, discord_user_id, display_name, booking_id, amount, actor_id, actor_name, details_json)
+                VALUES ('BET_PLACED',$1,$2,$3,$4,$1,$2,$5)
+                """,
+                ctx.author.id, ctx.author.display_name, booking_id, amount_value,
+                json.dumps({"bet_id": bet_id, "fighter": pick[1]}),
+            )
+            final_bet = await conn.fetchrow("SELECT * FROM sportsbook_bets WHERE id=$1", bet_id)
+            final_wallet = await conn.fetchrow("SELECT * FROM sportsbook_wallets WHERE discord_user_id=$1", ctx.author.id)
+    await ctx.send(
+        f"✅ **BET CONFIRMED — SLIP #{final_bet['id']}**\n"
+        f"Booking: **#{booking_id}**\nPick: **{pick[1]}**\n"
+        f"Total Wager: **{_sportsbook_money(final_bet['amount'])}**\n"
+        f"Potential Total Return: **{_sportsbook_money(int(final_bet['amount']) * 2)}**\n"
+        f"Available Balance: **{_sportsbook_money(final_wallet['available_balance'])}**"
+    )
+
+
+@bot.command()
+async def mybets(ctx):
+    async with bot.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT b.*, m.fighter1_name, m.fighter2_name, m.status AS market_status
+            FROM sportsbook_bets b
+            JOIN sportsbook_markets m ON m.booking_id=b.booking_id
+            WHERE b.discord_user_id=$1
+            ORDER BY b.id DESC
+            LIMIT 20
+            """,
+            ctx.author.id,
+        )
+    if not rows:
+        await ctx.send("🎟️ You have no OSBL sportsbook bets yet.")
+        return
+    embed = discord.Embed(title=f"🎟️ {ctx.author.display_name} — MY BETS", color=discord.Color.gold())
+    for r in rows:
+        status = str(r["status"]).upper()
+        value = (
+            f"Pick: **{r['fighter_name']}**\n"
+            f"Wager: **{_sportsbook_money(r['amount'])}**\n"
+            f"Status: **{status}**"
+        )
+        if int(r["payout_amount"] or 0):
+            value += f"\nReturn: **{_sportsbook_money(r['payout_amount'])}**"
+        embed.add_field(name=f"Slip #{r['id']} • Booking #{r['booking_id']}", value=value, inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def lockbets(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use: `!lockbets <Booking ID>`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1 FOR UPDATE", booking_id)
+            if not market:
+                await ctx.send("❌ Sportsbook market not found.")
+                return
+            if market["status"] not in ("open", "held"):
+                await ctx.send(f"⚠️ Market is already **{market['status'].upper()}**.")
+                return
+            await conn.execute(
+                """
+                UPDATE sportsbook_markets SET status='locked', locked_by_id=$2, locked_by_name=$3,
+                    locked_at=NOW(), status_note='Betting locked for fight'
+                WHERE booking_id=$1
+                """,
+                booking_id, ctx.author.id, ctx.author.display_name,
+            )
+            await conn.execute("UPDATE sportsbook_bets SET status='locked', updated_at=NOW() WHERE booking_id=$1 AND status='open'", booking_id)
+            await conn.execute(
+                "INSERT INTO sportsbook_audit (event_type,booking_id,actor_id,actor_name) VALUES ('MARKET_LOCKED',$1,$2,$3)",
+                booking_id, ctx.author.id, ctx.author.display_name,
+            )
+    await ctx.send(f"🔒 Betting locked for Booking **#{booking_id}**. No new wagers or changes are allowed.")
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def holdbets(ctx, booking_id: int = None, *, reason: str = "Official review"):
+    if booking_id is None:
+        await ctx.send("❌ Use: `!holdbets <Booking ID> [reason]`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1 FOR UPDATE", booking_id)
+            if not market:
+                await ctx.send("❌ Sportsbook market not found.")
+                return
+            if market["status"] in ("settled", "void"):
+                await ctx.send(f"❌ Market is already **{market['status'].upper()}**.")
+                return
+            await conn.execute(
+                "UPDATE sportsbook_markets SET status='held', status_note=$2 WHERE booking_id=$1",
+                booking_id, reason,
+            )
+            await conn.execute(
+                "UPDATE sportsbook_bets SET status='held', updated_at=NOW() WHERE booking_id=$1 AND status IN ('open','locked')",
+                booking_id,
+            )
+            await conn.execute(
+                "INSERT INTO sportsbook_audit (event_type,booking_id,actor_id,actor_name,details_json) VALUES ('MARKET_HELD',$1,$2,$3,$4)",
+                booking_id, ctx.author.id, ctx.author.display_name, json.dumps({"reason": reason}),
+            )
+    await ctx.send(f"⚖️ Betting funds for Booking **#{booking_id}** are now **HELD**. Reason: **{reason}**")
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def voidbets(ctx, booking_id: int = None, *, reason: str = "Fight voided / canceled"):
+    if booking_id is None:
+        await ctx.send("❌ Use: `!voidbets <Booking ID> [reason]`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1 FOR UPDATE", booking_id)
+            if not market:
+                await ctx.send("❌ Sportsbook market not found.")
+                return
+            if market["status"] in ("settled", "void"):
+                await ctx.send(f"⚠️ Market is already **{market['status'].upper()}**.")
+                return
+            count, total = await _sportsbook_refund_market(conn, booking_id, ctx.author, reason)
+    embed = discord.Embed(title="↩️ OSBL SPORTSBOOK — MARKET REFUNDED", color=discord.Color.orange())
+    embed.description = f"Booking **#{booking_id}**\nRefunded Bets: **{count}**\nFunds Returned: **{_sportsbook_money(total)}**\nReason: **{reason}**"
+    await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=embed)
+    await ctx.send(f"✅ Booking **#{booking_id}** voided and **{_sportsbook_money(total)}** refunded across **{count}** bet(s).")
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def settlebets(ctx, booking_id: int = None):
+    if booking_id is None:
+        await ctx.send("❌ Use: `!settlebets <Booking ID>`")
+        return
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            market = await conn.fetchrow("SELECT * FROM sportsbook_markets WHERE booking_id=$1 FOR UPDATE", booking_id)
+            if not market:
+                await ctx.send("❌ Sportsbook market not found.")
+                return
+            if market["status"] == "settled":
+                await ctx.send("⚠️ This market is already settled.")
+                return
+            if market["status"] == "void":
+                await ctx.send("⚠️ This market was voided and refunded.")
+                return
+            if market["status"] == "held":
+                await ctx.send("⚖️ This market is under HOLD. Resolve the review before settlement, or use `!voidbets` if the wager must be refunded.")
+                return
+
+            ruling = await conn.fetchrow(
+                """
+                SELECT * FROM commission_rulings
+                WHERE booking_id=$1 AND status='final'
+                ORDER BY id DESC LIMIT 1
+                """,
+                booking_id,
+            )
+            if ruling:
+                try:
+                    actions = json.loads(ruling["actions_json"] or "[]")
+                except Exception:
+                    actions = []
+                action_text = " ".join(str(x) for x in actions).casefold()
+                ruling_text = str(ruling["ruling_text"] or "").casefold()
+                if "draw" in action_text or "declared a draw" in ruling_text:
+                    count, total = await _sportsbook_refund_market(conn, booking_id, ctx.author, f"Commission Ruling #{ruling['id']} — Draw")
+                    refund_embed = discord.Embed(title="↩️ OSBL SPORTSBOOK — DRAW REFUND", color=discord.Color.orange())
+                    refund_embed.description = f"Booking **#{booking_id}**\nCommission Ruling **#{ruling['id']}**\nRefunded: **{count}** bet(s) • **{_sportsbook_money(total)}**"
+                    await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=refund_embed)
+                    await ctx.send(f"✅ Commission ruling declared a draw. **{count}** bet(s) refunded.")
+                    return
+                if "result change" in action_text:
+                    await ctx.send(
+                        f"⚖️ Commission Ruling **#{ruling['id']}** includes a **Result Change**. "
+                        "Use `!holdbets` until the corrected official result is recorded, then settle again, or `!voidbets` if the Commission orders a refund."
+                    )
+                    return
+
+            history = await conn.fetchrow(
+                """
+                SELECT * FROM fight_history
+                WHERE undone=FALSE
+                  AND created_at >= $1
+                  AND (
+                      (winner_key=$2 AND loser_key=$3)
+                      OR (winner_key=$3 AND loser_key=$2)
+                  )
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                market["opened_at"], market["fighter1_key"], market["fighter2_key"],
+            )
+            if not history:
+                await ctx.send("❌ No official non-reversed fight result was found for this market after betting opened. No wagers were settled.")
+                return
+
+            winner_key = history["winner_key"]
+            winner_name = market["fighter1_name"] if winner_key == market["fighter1_key"] else market["fighter2_name"]
+            bets = await conn.fetch(
+                """
+                SELECT * FROM sportsbook_bets
+                WHERE booking_id=$1 AND status IN ('open','locked')
+                ORDER BY id FOR UPDATE
+                """,
+                booking_id,
+            )
+            winner_count = loser_count = 0
+            total_return = total_lost = 0
+            for b in bets:
+                amount = int(b["amount"])
+                if b["fighter_key"] == winner_key:
+                    payout = amount * 2
+                    winner_count += 1
+                    total_return += payout
+                    await conn.execute(
+                        """
+                        UPDATE sportsbook_wallets
+                        SET locked_balance=GREATEST(locked_balance-$1,0),
+                            available_balance=available_balance+$2,
+                            net_profit=net_profit+$1,
+                            wins=wins+1,
+                            largest_win=GREATEST(largest_win,$1),
+                            updated_at=NOW()
+                        WHERE discord_user_id=$3
+                        """,
+                        amount, payout, b["discord_user_id"],
+                    )
+                    await conn.execute(
+                        "UPDATE sportsbook_bets SET status='won', payout_amount=$1, profit_amount=$2, settled_at=NOW(), updated_at=NOW() WHERE id=$3",
+                        payout, amount, b["id"],
+                    )
+                else:
+                    loser_count += 1
+                    total_lost += amount
+                    await conn.execute(
+                        """
+                        UPDATE sportsbook_wallets
+                        SET locked_balance=GREATEST(locked_balance-$1,0),
+                            net_profit=net_profit-$1,
+                            losses=losses+1,
+                            updated_at=NOW()
+                        WHERE discord_user_id=$2
+                        """,
+                        amount, b["discord_user_id"],
+                    )
+                    await conn.execute(
+                        "UPDATE sportsbook_bets SET status='lost', payout_amount=0, profit_amount=$1, settled_at=NOW(), updated_at=NOW() WHERE id=$2",
+                        -amount, b["id"],
+                    )
+            await conn.execute(
+                """
+                UPDATE sportsbook_markets
+                SET status='settled', winner_key=$2, winner_name=$3, result_history_id=$4,
+                    settled_by_id=$5, settled_by_name=$6, settled_at=NOW(), status_note='Official result settled'
+                WHERE booking_id=$1
+                """,
+                booking_id, winner_key, winner_name, history["id"], ctx.author.id, ctx.author.display_name,
+            )
+            await conn.execute(
+                """
+                INSERT INTO sportsbook_audit (event_type,booking_id,amount,actor_id,actor_name,details_json)
+                VALUES ('MARKET_SETTLED',$1,$2,$3,$4,$5)
+                """,
+                booking_id, total_return, ctx.author.id, ctx.author.display_name,
+                json.dumps({"winner": winner_name, "history_id": history["id"], "winning_bets": winner_count, "losing_bets": loser_count, "lost_stakes": total_lost}),
+            )
+    embed = discord.Embed(title="💵 OSBL BETTING RESULTS — SETTLED", color=discord.Color.green())
+    embed.description = (
+        f"Booking **#{booking_id}**\n"
+        f"Winner: **{winner_name}**\n"
+        f"Official History ID: **#{history['id']}**\n\n"
+        f"Winning Bets: **{winner_count}**\n"
+        f"Losing Bets: **{loser_count}**\n"
+        f"Total Returned to Winners: **{_sportsbook_money(total_return)}**\n"
+        f"Losing Stakes: **{_sportsbook_money(total_lost)}**"
+    )
+    await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=embed)
+    await ctx.send(f"✅ Sportsbook market for Booking **#{booking_id}** settled. Winner: **{winner_name}**.")
+
+
+@bot.command()
+async def bettingboard(ctx):
+    async with bot.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT display_name, net_profit, wins, losses, total_wagered, largest_win, available_balance
+            FROM sportsbook_wallets
+            WHERE total_wagered > 0
+            ORDER BY net_profit DESC, wins DESC,
+                     CASE WHEN (wins+losses)>0 THEN wins::numeric/(wins+losses) ELSE 0 END DESC,
+                     largest_win DESC, display_name ASC
+            LIMIT 10
+            """
+        )
+    if not rows:
+        await ctx.send("🏆 The OSBL betting leaderboard is empty. No settled betting activity yet.")
+        return
+    lines=[]
+    for i,r in enumerate(rows,1):
+        total=int(r["wins"])+int(r["losses"])
+        pct=(int(r["wins"])/total*100) if total else 0
+        medal="👑" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"**#{i}**"))
+        lines.append(
+            f"{medal} **{r['display_name']}** — Profit **{_sportsbook_money(r['net_profit'])}** • "
+            f"{r['wins']}W-{r['losses']}L ({pct:.0f}%) • Biggest Win **{_sportsbook_money(r['largest_win'])}**"
+        )
+    embed=discord.Embed(title="🏆 OSBL SPORTSBOOK LEADERBOARD", description="\n".join(lines), color=discord.Color.gold())
+    embed.set_footer(text="Ranked by total sportsbook profit • Settled wagers only")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+async def bettingaudit(ctx, limit: int = 20):
+    limit=max(1,min(int(limit or 20),40))
+    async with bot.db.acquire() as conn:
+        rows=await conn.fetch(
+            "SELECT * FROM sportsbook_audit ORDER BY id DESC LIMIT $1", limit
+        )
+        wallet_totals=await conn.fetchrow(
+            """
+            SELECT COALESCE(SUM(available_balance),0)::BIGINT AS available,
+                   COALESCE(SUM(locked_balance),0)::BIGINT AS locked,
+                   COALESCE(SUM(pending_withdrawal),0)::BIGINT AS pending,
+                   COALESCE(SUM(total_deposited),0)::BIGINT AS deposited,
+                   COALESCE(SUM(total_withdrawn),0)::BIGINT AS withdrawn
+            FROM sportsbook_wallets
+            """
+        )
+    embed=discord.Embed(title="🔍 OSBL SPORTSBOOK AUDIT", color=discord.Color.gold())
+    embed.add_field(
+        name="Ledger Snapshot",
+        value=(
+            f"Available: **{_sportsbook_money(wallet_totals['available'])}**\n"
+            f"Locked Bets: **{_sportsbook_money(wallet_totals['locked'])}**\n"
+            f"Pending Withdrawals: **{_sportsbook_money(wallet_totals['pending'])}**\n"
+            f"Confirmed Deposits: **{_sportsbook_money(wallet_totals['deposited'])}**\n"
+            f"Confirmed Withdrawals: **{_sportsbook_money(wallet_totals['withdrawn'])}**"
+        ),
+        inline=False,
+    )
+    lines=[]
+    for r in rows:
+        who=r["display_name"] or r["actor_name"] or "System"
+        detail=f" • {_sportsbook_money(r['amount'])}" if r["amount"] is not None else ""
+        b=f" • Booking #{r['booking_id']}" if r["booking_id"] is not None else ""
+        lines.append(f"`#{r['id']}` **{r['event_type']}** • {who}{detail}{b}")
+    embed.add_field(name=f"Recent {len(rows)} Audit Events", value="\n".join(lines) if lines else "No events yet.", inline=False)
+    embed.set_footer(text=SPORTSBOOK_SYSTEM_VERSION)
+    await ctx.send(embed=embed)
 
 
 # =========================================================
