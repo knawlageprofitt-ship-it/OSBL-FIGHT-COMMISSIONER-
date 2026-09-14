@@ -804,7 +804,7 @@ DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
 COMMISSION_ARCHIVE_VERSION = "V1-COMMISSION-ARCHIVE-2026-09-13"
-SPORTSBOOK_SYSTEM_VERSION = "V2-LEADERBOARD-RECEIPTS-2026-09-14"
+SPORTSBOOK_SYSTEM_VERSION = "V3-PREMIUM-LEADERBOARD-RECEIPTS-2026-09-14"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -11774,6 +11774,103 @@ async def settlebets(ctx, booking_id: int = None):
     await ctx.send(f"✅ Sportsbook market for Booking **#{booking_id}** settled. Winner: **{winner_name}**.")
 
 
+def _sportsbook_leaderboard_image(rows):
+    """Render a premium OSBL sportsbook leaderboard image from live wallet data."""
+    from PIL import Image, ImageDraw
+
+    W, H = 1400, 1600
+    image = Image.new("RGB", (W, H), (12, 12, 14))
+    draw = ImageDraw.Draw(image)
+
+    gold = (212, 167, 67)
+    gold2 = (245, 206, 111)
+    white = (245, 245, 245)
+    silver = (190, 194, 202)
+    red = (165, 28, 32)
+    dark = (20, 20, 24)
+    panel = (27, 27, 32)
+    line = (108, 83, 35)
+
+    # Arena-style background bands / accents.
+    draw.rectangle((0, 0, W, 250), fill=(8, 8, 10))
+    draw.rectangle((0, 250, W, H), fill=(15, 15, 18))
+    draw.rectangle((0, 0, 18, H), fill=gold)
+    draw.rectangle((W-18, 0, W, H), fill=gold)
+    draw.rectangle((32, 28, W-32, H-28), outline=gold, width=4)
+    draw.rectangle((46, 42, W-46, H-42), outline=(80, 61, 28), width=2)
+
+    # Top title plate.
+    draw.rounded_rectangle((85, 70, W-85, 255), radius=28, fill=(18, 18, 22), outline=gold, width=5)
+    draw.rectangle((110, 225, W-110, 232), fill=red)
+    title_font = _load_osbl_font(86, bold=True)
+    sub_font = _load_osbl_font(34, bold=True)
+    small_font = _load_osbl_font(26, bold=True)
+    body_font = _load_osbl_font(31, bold=True)
+    body_reg = _load_osbl_font(28, bold=False)
+    rank_font = _load_osbl_font(38, bold=True)
+
+    _draw_centered(draw, (100, 83, W-100, 175), "OSBL SPORTSBOOK", title_font, fill=gold2, stroke=2)
+    _draw_centered(draw, (100, 164, W-100, 220), "LEADERBOARD", _load_osbl_font(58, bold=True), fill=white, stroke=2)
+    _draw_centered(draw, (120, 236, W-120, 290), "KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD", sub_font, fill=silver, stroke=1)
+
+    # Table frame.
+    top = 325
+    bottom = 1455
+    left = 70
+    right = W-70
+    draw.rounded_rectangle((left, top, right, bottom), radius=22, fill=panel, outline=gold, width=5)
+
+    # Column coordinates.
+    cols = [left, 170, 520, 760, 930, 1110, right]
+    headers = ["RANK", "BETTOR", "NET PROFIT", "RECORD", "WAGERED", "BALANCE"]
+    draw.rectangle((left+4, top+4, right-4, top+100), fill=(22, 22, 26))
+    draw.line((left, top+100, right, top+100), fill=gold, width=3)
+    for x in cols[1:-1]:
+        draw.line((x, top, x, bottom), fill=line, width=2)
+    for i, label in enumerate(headers):
+        _draw_centered(draw, (cols[i]+5, top+20, cols[i+1]-5, top+83), label, small_font, fill=gold2, stroke=1)
+
+    row_h = 98
+    y = top + 100
+    for idx in range(10):
+        y1 = y + idx*row_h
+        y2 = y1 + row_h
+        if idx % 2 == 0:
+            draw.rectangle((left+4, y1, right-4, y2), fill=dark)
+        draw.line((left, y2, right, y2), fill=(72, 58, 31), width=1)
+
+        if idx >= len(rows):
+            _draw_centered(draw, (cols[0], y1, cols[1], y2), str(idx+1), rank_font, fill=(95, 95, 100), stroke=1)
+            continue
+
+        r = rows[idx]
+        wins = int(r["wins"] or 0)
+        losses = int(r["losses"] or 0)
+        total = wins + losses
+        pct = (wins / total * 100) if total else 0
+        rank_text = "1" if idx == 0 else str(idx+1)
+        rank_color = gold2 if idx == 0 else (220,220,220) if idx == 1 else (190,120,65) if idx == 2 else white
+        _draw_centered(draw, (cols[0], y1, cols[1], y2), rank_text, rank_font, fill=rank_color, stroke=1)
+
+        name = str(r["display_name"] or "Unknown")
+        name_font = _fit_font(draw, name, cols[2]-cols[1]-24, 31, 20)
+        _draw_centered(draw, (cols[1]+10, y1, cols[2]-10, y2), name, name_font, fill=white, stroke=1)
+        _draw_centered(draw, (cols[2]+6, y1, cols[3]-6, y2), _sportsbook_money(r["net_profit"]), body_font, fill=gold2 if int(r["net_profit"] or 0) >= 0 else (235,90,90), stroke=1)
+        _draw_centered(draw, (cols[3]+4, y1, cols[4]-4, y2), f"{wins}W-{losses}L\n{pct:.0f}%", body_reg, fill=white, stroke=1)
+        _draw_centered(draw, (cols[4]+4, y1, cols[5]-4, y2), _sportsbook_money(r["total_wagered"]), body_reg, fill=white, stroke=1)
+        _draw_centered(draw, (cols[5]+4, y1, cols[6]-4, y2), _sportsbook_money(r["available_balance"]), body_reg, fill=white, stroke=1)
+
+    # Bottom belt-style information plate.
+    draw.rounded_rectangle((145, 1480, W-145, 1560), radius=22, fill=(18,18,22), outline=gold, width=3)
+    _draw_centered(draw, (170, 1493, W-170, 1533), "RANKED BY TOTAL SPORTSBOOK PROFIT", small_font, fill=gold2, stroke=1)
+    _draw_centered(draw, (170, 1525, W-170, 1553), "REFUNDS DO NOT COUNT AS WINS OR LOSSES", _load_osbl_font(22, bold=True), fill=silver, stroke=1)
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
 @bot.command(name="bettingboard", aliases=["bettingleaderboard", "sportsbookleaderboard"])
 async def bettingboard(ctx):
     async with bot.db.acquire() as conn:
@@ -11792,33 +11889,47 @@ async def bettingboard(ctx):
         await ctx.send("🏆 The OSBL betting leaderboard is empty. No betting activity has been recorded yet.")
         return
 
-    border = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    embed = discord.Embed(
-        title="🏆 OSBL SPORTSBOOK LEADERBOARD",
-        description=(
-            f"{border}\n"
-            "**KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD**\n"
-            f"{border}"
-        ),
-        color=discord.Color.gold(),
-    )
-    for i, r in enumerate(rows, 1):
-        total = int(r["wins"]) + int(r["losses"])
-        pct = (int(r["wins"]) / total * 100) if total else 0
-        rank_icon = "👑" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"#{i}"))
-        embed.add_field(
-            name=f"{rank_icon}  {r['display_name']}",
-            value=(
-                f"**Net Profit:** {_sportsbook_money(r['net_profit'])}\n"
-                f"**Record:** {r['wins']}W-{r['losses']}L • {pct:.0f}%\n"
-                f"**Total Wagered:** {_sportsbook_money(r['total_wagered'])}\n"
-                f"**Largest Win:** {_sportsbook_money(r['largest_win'])}\n"
-                f"**Current Balance:** {_sportsbook_money(r['available_balance'])}"
-            ),
-            inline=False,
+    try:
+        board_buf = _sportsbook_leaderboard_image(rows)
+        file = discord.File(board_buf, filename="osbl_sportsbook_leaderboard.png")
+        embed = discord.Embed(
+            title="🏆 OSBL SPORTSBOOK LEADERBOARD",
+            description="**KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD**",
+            color=discord.Color.gold(),
         )
-    embed.set_footer(text=f"{SPORTSBOOK_SYSTEM_VERSION} • Ranked by total sportsbook profit • Refunds do not count as wins or losses")
-    await ctx.send(embed=embed)
+        embed.set_image(url="attachment://osbl_sportsbook_leaderboard.png")
+        embed.set_footer(text=f"{SPORTSBOOK_SYSTEM_VERSION} • Live sportsbook standings")
+        await ctx.send(embed=embed, file=file)
+    except Exception as exc:
+        # Preserve a clean fallback if image rendering ever fails on the host.
+        print(f"Leaderboard render error: {exc}")
+        border = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        embed = discord.Embed(
+            title="🏆 OSBL SPORTSBOOK LEADERBOARD",
+            description=(
+                f"{border}\n"
+                "**KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD**\n"
+                f"{border}"
+            ),
+            color=discord.Color.gold(),
+        )
+        for i, r in enumerate(rows, 1):
+            total = int(r["wins"]) + int(r["losses"])
+            pct = (int(r["wins"]) / total * 100) if total else 0
+            rank_icon = "👑" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"#{i}"))
+            embed.add_field(
+                name=f"{rank_icon}  {r['display_name']}",
+                value=(
+                    f"**Net Profit:** {_sportsbook_money(r['net_profit'])}\n"
+                    f"**Record:** {r['wins']}W-{r['losses']}L • {pct:.0f}%\n"
+                    f"**Total Wagered:** {_sportsbook_money(r['total_wagered'])}\n"
+                    f"**Largest Win:** {_sportsbook_money(r['largest_win'])}\n"
+                    f"**Current Balance:** {_sportsbook_money(r['available_balance'])}"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text=f"{SPORTSBOOK_SYSTEM_VERSION} • Ranked by total sportsbook profit • Refunds do not count as wins or losses")
+        await ctx.send(embed=embed)
 
 
 @bot.command()
