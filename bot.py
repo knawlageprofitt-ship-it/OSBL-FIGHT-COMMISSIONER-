@@ -804,7 +804,7 @@ DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
 COMMISSION_ARCHIVE_VERSION = "V1-COMMISSION-ARCHIVE-2026-09-13"
-SPORTSBOOK_SYSTEM_VERSION = "V1-PREPAID-SPORTSBOOK-2026-09-14"
+SPORTSBOOK_SYSTEM_VERSION = "V2-LEADERBOARD-RECEIPTS-2026-09-14"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -1014,6 +1014,7 @@ async def systemcheck(ctx):
         "settlebets",
         "voidbets",
         "bettingaudit",
+        "bettingboard",
     ]
 
     missing_commands = []
@@ -10673,6 +10674,72 @@ async def _sportsbook_post(guild, channel_name, *, content=None, embed=None):
         return False
 
 
+async def _sportsbook_send_receipt(
+    discord_user_id,
+    display_name,
+    receipt_title,
+    status,
+    amount=None,
+    booking_id=None,
+    slip_id=None,
+    request_id=None,
+    details=None,
+    color=None,
+):
+    """Send a private sportsbook transaction receipt directly to the bettor.
+
+    Receipt delivery is best-effort and never rolls back a completed sportsbook
+    transaction if the member has Discord DMs disabled.
+    """
+    try:
+        user = bot.get_user(int(discord_user_id))
+        if user is None:
+            user = await bot.fetch_user(int(discord_user_id))
+
+        wallet = None
+        try:
+            async with bot.db.acquire() as conn:
+                wallet = await conn.fetchrow(
+                    "SELECT * FROM sportsbook_wallets WHERE discord_user_id=$1",
+                    int(discord_user_id),
+                )
+        except Exception:
+            wallet = None
+
+        embed = discord.Embed(
+            title=f"🧾 OSBL SPORTSBOOK RECEIPT — {receipt_title}",
+            description=f"Bettor: **{display_name}**\nStatus: **{status}**",
+            color=color or discord.Color.gold(),
+        )
+        if amount is not None:
+            embed.add_field(name="💵 Amount", value=f"**{_sportsbook_money(amount)}**", inline=True)
+        if booking_id is not None:
+            embed.add_field(name="🥊 Booking", value=f"**#{booking_id}**", inline=True)
+        if slip_id is not None:
+            embed.add_field(name="🎟️ Bet Slip", value=f"**#{slip_id}**", inline=True)
+        if request_id is not None:
+            embed.add_field(name="🏦 Request", value=f"**#{request_id}**", inline=True)
+        if details:
+            embed.add_field(name="📋 Transaction Details", value=str(details), inline=False)
+        if wallet:
+            total = int(wallet["available_balance"]) + int(wallet["locked_balance"]) + int(wallet["pending_withdrawal"])
+            embed.add_field(
+                name="💰 Sportsbook Wallet After Transaction",
+                value=(
+                    f"Available: **{_sportsbook_money(wallet['available_balance'])}**\n"
+                    f"Locked in Bets: **{_sportsbook_money(wallet['locked_balance'])}**\n"
+                    f"Pending Withdrawal: **{_sportsbook_money(wallet['pending_withdrawal'])}**\n"
+                    f"Total Wallet: **{_sportsbook_money(total)}**"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text=f"{SPORTSBOOK_SYSTEM_VERSION} • PRIVATE BETTOR RECEIPT • ONE LEAGUE. ONE STANDARD. ONE CHAMPION.")
+        await user.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+        return False
+
+
 async def _sportsbook_is_bout_participant(conn, user_id, market):
     linked_key = await conn.fetchval(
         "SELECT fighter_key FROM fighter_discord_links WHERE discord_user_id = $1",
@@ -10708,6 +10775,7 @@ async def _sportsbook_refund_market(conn, booking_id, actor, reason):
         booking_id,
     )
     total = 0
+    refund_receipts = []
     for row in rows:
         amount = int(row["amount"])
         total += amount
@@ -10733,6 +10801,12 @@ async def _sportsbook_refund_market(conn, booking_id, actor, reason):
             amount,
             row["id"],
         )
+        refund_receipts.append({
+            "discord_user_id": row["discord_user_id"],
+            "display_name": row["display_name"],
+            "amount": amount,
+            "bet_id": row["id"],
+        })
     await conn.execute(
         """
         UPDATE sportsbook_markets
@@ -10757,7 +10831,7 @@ async def _sportsbook_refund_market(conn, booking_id, actor, reason):
         actor.display_name,
         json.dumps({"reason": reason, "bet_count": len(rows)}),
     )
-    return len(rows), total
+    return len(rows), total, refund_receipts
 
 
 @bot.command()
@@ -10821,6 +10895,12 @@ async def betdeposit(ctx, amount: str = None):
         f"Amount: **{_sportsbook_money(amount_value)}**\n\n"
         "Transfer the matching in-game amount to the authorized OSBL Sportsbook holder. "
         "Your wallet will not be credited until staff verifies the in-game transfer."
+    )
+    await _sportsbook_send_receipt(
+        ctx.author.id, ctx.author.display_name, "DEPOSIT REQUEST", "PENDING VERIFICATION",
+        amount=amount_value, request_id=request_id,
+        details="Transfer the matching in-game amount to the authorized OSBL Sportsbook holder. Funds are credited only after staff verification.",
+        color=discord.Color.orange(),
     )
 
 
@@ -10891,6 +10971,12 @@ async def betwithdraw(ctx, amount: str = None):
         f"💸 **OSBL SPORTSBOOK WITHDRAWAL REQUEST #{request_id}**\n"
         f"Amount: **{_sportsbook_money(amount_value)}**\n"
         "Those funds are now locked from betting until authorized staff completes or rejects the request."
+    )
+    await _sportsbook_send_receipt(
+        ctx.author.id, ctx.author.display_name, "WITHDRAWAL REQUEST", "PENDING PAYMENT",
+        amount=amount_value, request_id=request_id,
+        details="These funds are reserved and cannot be wagered while the withdrawal is pending.",
+        color=discord.Color.orange(),
     )
 
 
@@ -10975,6 +11061,12 @@ async def confirmbetdeposit(ctx, request_id: int = None):
         f"Credited: **{_sportsbook_money(request['amount'])}**\n"
         f"Available Balance: **{_sportsbook_money(balance)}**"
     )
+    await _sportsbook_send_receipt(
+        request["discord_user_id"], request["display_name"], "DEPOSIT CONFIRMED", "PAID INTO SPORTSBOOK WALLET",
+        amount=request["amount"], request_id=request_id,
+        details=f"Verified by **{ctx.author.display_name}**. Your confirmed in-game deposit is now available for wagering.",
+        color=discord.Color.green(),
+    )
 
 
 @bot.command()
@@ -11031,6 +11123,12 @@ async def confirmbetwithdraw(ctx, request_id: int = None):
         f"Player: **{request['display_name']}**\n"
         f"Paid in-game: **{_sportsbook_money(request['amount'])}**"
     )
+    await _sportsbook_send_receipt(
+        request["discord_user_id"], request["display_name"], "WITHDRAWAL CONFIRMED", "PAID IN-GAME",
+        amount=request["amount"], request_id=request_id,
+        details=f"Payment confirmed by **{ctx.author.display_name}**.",
+        color=discord.Color.green(),
+    )
 
 
 @bot.command()
@@ -11079,6 +11177,12 @@ async def rejectbetrequest(ctx, request_id: int = None, *, reason: str = "Not ap
                 json.dumps({"request_id": request_id, "type": request["request_type"], "reason": reason}),
             )
     await ctx.send(f"🛑 Sportsbook Request **#{request_id}** rejected. Reason: **{reason}**")
+    await _sportsbook_send_receipt(
+        request["discord_user_id"], request["display_name"], "BANK REQUEST REJECTED", "REJECTED",
+        amount=request["amount"], request_id=request_id,
+        details=f"{request['request_type'].title()} request rejected. Reason: **{reason}**",
+        color=discord.Color.red(),
+    )
 
 
 @bot.command()
@@ -11346,6 +11450,15 @@ async def bet(ctx, booking_id: int = None, *, details: str = None):
         f"Potential Total Return: **{_sportsbook_money(int(final_bet['amount']) * 2)}**\n"
         f"Available Balance: **{_sportsbook_money(final_wallet['available_balance'])}**"
     )
+    await _sportsbook_send_receipt(
+        ctx.author.id, ctx.author.display_name, "BET CONFIRMED", "WAGER LOCKED",
+        amount=final_bet["amount"], booking_id=booking_id, slip_id=final_bet["id"],
+        details=(
+            f"Pick: **{pick[1]}**\n"
+            f"Potential Total Return: **{_sportsbook_money(int(final_bet['amount']) * 2)}**"
+        ),
+        color=discord.Color.gold(),
+    )
 
 
 @bot.command()
@@ -11455,10 +11568,16 @@ async def voidbets(ctx, booking_id: int = None, *, reason: str = "Fight voided /
             if market["status"] in ("settled", "void"):
                 await ctx.send(f"⚠️ Market is already **{market['status'].upper()}**.")
                 return
-            count, total = await _sportsbook_refund_market(conn, booking_id, ctx.author, reason)
+            count, total, refund_receipts = await _sportsbook_refund_market(conn, booking_id, ctx.author, reason)
     embed = discord.Embed(title="↩️ OSBL SPORTSBOOK — MARKET REFUNDED", color=discord.Color.orange())
     embed.description = f"Booking **#{booking_id}**\nRefunded Bets: **{count}**\nFunds Returned: **{_sportsbook_money(total)}**\nReason: **{reason}**"
     await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=embed)
+    for receipt in refund_receipts:
+        await _sportsbook_send_receipt(
+            receipt["discord_user_id"], receipt["display_name"], "BET REFUND", "REFUNDED",
+            amount=receipt["amount"], booking_id=booking_id, slip_id=receipt["bet_id"],
+            details=f"Reason: **{reason}**", color=discord.Color.orange(),
+        )
     await ctx.send(f"✅ Booking **#{booking_id}** voided and **{_sportsbook_money(total)}** refunded across **{count}** bet(s).")
 
 
@@ -11500,10 +11619,17 @@ async def settlebets(ctx, booking_id: int = None):
                 action_text = " ".join(str(x) for x in actions).casefold()
                 ruling_text = str(ruling["ruling_text"] or "").casefold()
                 if "draw" in action_text or "declared a draw" in ruling_text:
-                    count, total = await _sportsbook_refund_market(conn, booking_id, ctx.author, f"Commission Ruling #{ruling['id']} — Draw")
+                    count, total, refund_receipts = await _sportsbook_refund_market(conn, booking_id, ctx.author, f"Commission Ruling #{ruling['id']} — Draw")
                     refund_embed = discord.Embed(title="↩️ OSBL SPORTSBOOK — DRAW REFUND", color=discord.Color.orange())
                     refund_embed.description = f"Booking **#{booking_id}**\nCommission Ruling **#{ruling['id']}**\nRefunded: **{count}** bet(s) • **{_sportsbook_money(total)}**"
                     await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=refund_embed)
+                    for receipt in refund_receipts:
+                        await _sportsbook_send_receipt(
+                            receipt["discord_user_id"], receipt["display_name"], "DRAW REFUND", "REFUNDED",
+                            amount=receipt["amount"], booking_id=booking_id, slip_id=receipt["bet_id"],
+                            details=f"Commission Ruling **#{ruling['id']}** declared the fight a draw. Full stake returned.",
+                            color=discord.Color.orange(),
+                        )
                     await ctx.send(f"✅ Commission ruling declared a draw. **{count}** bet(s) refunded.")
                     return
                 if "result change" in action_text:
@@ -11543,6 +11669,7 @@ async def settlebets(ctx, booking_id: int = None):
             )
             winner_count = loser_count = 0
             total_return = total_lost = 0
+            settlement_receipts = []
             for b in bets:
                 amount = int(b["amount"])
                 if b["fighter_key"] == winner_key:
@@ -11566,6 +11693,11 @@ async def settlebets(ctx, booking_id: int = None):
                         "UPDATE sportsbook_bets SET status='won', payout_amount=$1, profit_amount=$2, settled_at=NOW(), updated_at=NOW() WHERE id=$3",
                         payout, amount, b["id"],
                     )
+                    settlement_receipts.append({
+                        "discord_user_id": b["discord_user_id"], "display_name": b["display_name"],
+                        "bet_id": b["id"], "amount": amount, "payout": payout,
+                        "fighter_name": b["fighter_name"], "result": "WON",
+                    })
                 else:
                     loser_count += 1
                     total_lost += amount
@@ -11584,6 +11716,11 @@ async def settlebets(ctx, booking_id: int = None):
                         "UPDATE sportsbook_bets SET status='lost', payout_amount=0, profit_amount=$1, settled_at=NOW(), updated_at=NOW() WHERE id=$2",
                         -amount, b["id"],
                     )
+                    settlement_receipts.append({
+                        "discord_user_id": b["discord_user_id"], "display_name": b["display_name"],
+                        "bet_id": b["id"], "amount": amount, "payout": 0,
+                        "fighter_name": b["fighter_name"], "result": "LOST",
+                    })
             await conn.execute(
                 """
                 UPDATE sportsbook_markets
@@ -11612,10 +11749,32 @@ async def settlebets(ctx, booking_id: int = None):
         f"Losing Stakes: **{_sportsbook_money(total_lost)}**"
     )
     await _sportsbook_post(ctx.guild, SPORTSBOOK_RESULTS_CHANNEL, embed=embed)
+    for receipt in settlement_receipts:
+        if receipt["result"] == "WON":
+            details = (
+                f"Pick: **{receipt['fighter_name']}**\n"
+                f"Official Winner: **{winner_name}**\n"
+                f"Stake Returned: **{_sportsbook_money(receipt['amount'])}**\n"
+                f"Profit: **{_sportsbook_money(receipt['amount'])}**\n"
+                f"Total Return: **{_sportsbook_money(receipt['payout'])}**"
+            )
+            color = discord.Color.green()
+        else:
+            details = (
+                f"Pick: **{receipt['fighter_name']}**\n"
+                f"Official Winner: **{winner_name}**\n"
+                f"Wager Lost: **{_sportsbook_money(receipt['amount'])}**"
+            )
+            color = discord.Color.red()
+        await _sportsbook_send_receipt(
+            receipt["discord_user_id"], receipt["display_name"], "BET SETTLED", receipt["result"],
+            amount=receipt["payout"] if receipt["result"] == "WON" else receipt["amount"],
+            booking_id=booking_id, slip_id=receipt["bet_id"], details=details, color=color,
+        )
     await ctx.send(f"✅ Sportsbook market for Booking **#{booking_id}** settled. Winner: **{winner_name}**.")
 
 
-@bot.command()
+@bot.command(name="bettingboard", aliases=["bettingleaderboard", "sportsbookleaderboard"])
 async def bettingboard(ctx):
     async with bot.db.acquire() as conn:
         rows = await conn.fetch(
@@ -11630,19 +11789,35 @@ async def bettingboard(ctx):
             """
         )
     if not rows:
-        await ctx.send("🏆 The OSBL betting leaderboard is empty. No settled betting activity yet.")
+        await ctx.send("🏆 The OSBL betting leaderboard is empty. No betting activity has been recorded yet.")
         return
-    lines=[]
-    for i,r in enumerate(rows,1):
-        total=int(r["wins"])+int(r["losses"])
-        pct=(int(r["wins"])/total*100) if total else 0
-        medal="👑" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"**#{i}**"))
-        lines.append(
-            f"{medal} **{r['display_name']}** — Profit **{_sportsbook_money(r['net_profit'])}** • "
-            f"{r['wins']}W-{r['losses']}L ({pct:.0f}%) • Biggest Win **{_sportsbook_money(r['largest_win'])}**"
+
+    border = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    embed = discord.Embed(
+        title="🏆 OSBL SPORTSBOOK LEADERBOARD",
+        description=(
+            f"{border}\n"
+            "**KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD**\n"
+            f"{border}"
+        ),
+        color=discord.Color.gold(),
+    )
+    for i, r in enumerate(rows, 1):
+        total = int(r["wins"]) + int(r["losses"])
+        pct = (int(r["wins"]) / total * 100) if total else 0
+        rank_icon = "👑" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"#{i}"))
+        embed.add_field(
+            name=f"{rank_icon}  {r['display_name']}",
+            value=(
+                f"**Net Profit:** {_sportsbook_money(r['net_profit'])}\n"
+                f"**Record:** {r['wins']}W-{r['losses']}L • {pct:.0f}%\n"
+                f"**Total Wagered:** {_sportsbook_money(r['total_wagered'])}\n"
+                f"**Largest Win:** {_sportsbook_money(r['largest_win'])}\n"
+                f"**Current Balance:** {_sportsbook_money(r['available_balance'])}"
+            ),
+            inline=False,
         )
-    embed=discord.Embed(title="🏆 OSBL SPORTSBOOK LEADERBOARD", description="\n".join(lines), color=discord.Color.gold())
-    embed.set_footer(text="Ranked by total sportsbook profit • Settled wagers only")
+    embed.set_footer(text=f"{SPORTSBOOK_SYSTEM_VERSION} • Ranked by total sportsbook profit • Refunds do not count as wins or losses")
     await ctx.send(embed=embed)
 
 
