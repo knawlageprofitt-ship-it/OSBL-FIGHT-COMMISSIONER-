@@ -804,7 +804,7 @@ DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
 COMMISSION_RULING_VERSION = "V1-COMMISSION-RULINGS-2026-09-13"
 COMMISSION_ARCHIVE_VERSION = "V1-COMMISSION-ARCHIVE-2026-09-13"
-SPORTSBOOK_SYSTEM_VERSION = "V3-PREMIUM-LEADERBOARD-RECEIPTS-2026-09-14"
+SPORTSBOOK_SYSTEM_VERSION = "V4-MOBILE-LEADERBOARD-RECEIPTS-2026-09-14"
 
 # =========================================================
 # SYSTEM HEALTH CHECK
@@ -11775,72 +11775,89 @@ async def settlebets(ctx, booking_id: int = None):
 
 
 def _sportsbook_leaderboard_image(rows):
-    """Render a premium OSBL sportsbook leaderboard image from live wallet data."""
+    """Render a mobile-readable premium OSBL sportsbook leaderboard image."""
     from PIL import Image, ImageDraw
+    import unicodedata
 
-    W, H = 1400, 1600
-    image = Image.new("RGB", (W, H), (12, 12, 14))
+    def clean_name(value):
+        # Discord display names can contain emoji/variation selectors that the
+        # Railway host font may render as empty boxes. Keep readable text,
+        # letters, numbers, spaces, and common punctuation for the poster.
+        raw = str(value or "Unknown")
+        out = []
+        for ch in unicodedata.normalize("NFKC", raw):
+            cat = unicodedata.category(ch)
+            if cat.startswith("L") or cat.startswith("N") or ch in " ._-'&":
+                out.append(ch)
+        cleaned = "".join(out).strip()
+        return cleaned or "Unknown"
+
+    W, H = 1600, 2100
+    image = Image.new("RGB", (W, H), (10, 10, 12))
     draw = ImageDraw.Draw(image)
 
     gold = (212, 167, 67)
-    gold2 = (245, 206, 111)
-    white = (245, 245, 245)
-    silver = (190, 194, 202)
-    red = (165, 28, 32)
-    dark = (20, 20, 24)
-    panel = (27, 27, 32)
-    line = (108, 83, 35)
+    gold2 = (247, 211, 119)
+    white = (248, 248, 248)
+    silver = (199, 203, 211)
+    red = (172, 31, 36)
+    dark = (18, 18, 22)
+    panel = (25, 25, 30)
+    line = (111, 85, 37)
 
-    # Arena-style background bands / accents.
-    draw.rectangle((0, 0, W, 250), fill=(8, 8, 10))
-    draw.rectangle((0, 250, W, H), fill=(15, 15, 18))
-    draw.rectangle((0, 0, 18, H), fill=gold)
-    draw.rectangle((W-18, 0, W, H), fill=gold)
-    draw.rectangle((32, 28, W-32, H-28), outline=gold, width=4)
-    draw.rectangle((46, 42, W-46, H-42), outline=(80, 61, 28), width=2)
+    # Heavy premium frame with more interior breathing room for mobile.
+    draw.rectangle((0, 0, W, H), fill=(13, 13, 16))
+    draw.rectangle((0, 0, 22, H), fill=gold)
+    draw.rectangle((W-22, 0, W, H), fill=gold)
+    draw.rectangle((38, 35, W-38, H-35), outline=gold, width=5)
+    draw.rectangle((55, 52, W-55, H-52), outline=(91, 69, 31), width=2)
 
-    # Top title plate.
-    draw.rounded_rectangle((85, 70, W-85, 255), radius=28, fill=(18, 18, 22), outline=gold, width=5)
-    draw.rectangle((110, 225, W-110, 232), fill=red)
-    title_font = _load_osbl_font(86, bold=True)
-    sub_font = _load_osbl_font(34, bold=True)
-    small_font = _load_osbl_font(26, bold=True)
-    body_font = _load_osbl_font(31, bold=True)
-    body_reg = _load_osbl_font(28, bold=False)
-    rank_font = _load_osbl_font(38, bold=True)
+    title_font = _load_osbl_font(98, bold=True)
+    leader_font = _load_osbl_font(68, bold=True)
+    slogan_font = _load_osbl_font(32, bold=True)
+    header_font = _load_osbl_font(32, bold=True)
+    body_font = _load_osbl_font(39, bold=True)
+    body_reg = _load_osbl_font(36, bold=False)
+    rank_font = _load_osbl_font(48, bold=True)
 
-    _draw_centered(draw, (100, 83, W-100, 175), "OSBL SPORTSBOOK", title_font, fill=gold2, stroke=2)
-    _draw_centered(draw, (100, 164, W-100, 220), "LEADERBOARD", _load_osbl_font(58, bold=True), fill=white, stroke=2)
-    _draw_centered(draw, (120, 236, W-120, 290), "KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD", sub_font, fill=silver, stroke=1)
+    # Header plate.
+    draw.rounded_rectangle((90, 72, W-90, 310), radius=32, fill=(17, 17, 21), outline=gold, width=6)
+    _draw_centered(draw, (120, 90, W-120, 195), "OSBL SPORTSBOOK", title_font, fill=gold2, stroke=2)
+    _draw_centered(draw, (120, 188, W-120, 260), "LEADERBOARD", leader_font, fill=white, stroke=2)
+    draw.rectangle((135, 275, W-135, 283), fill=red)
+    _draw_centered(draw, (130, 300, W-130, 355), "KNOW THE FIGHTS • BACK YOUR PICKS • CLIMB THE BOARD", slogan_font, fill=silver, stroke=1)
 
-    # Table frame.
-    top = 325
-    bottom = 1455
-    left = 70
-    right = W-70
-    draw.rounded_rectangle((left, top, right, bottom), radius=22, fill=panel, outline=gold, width=5)
+    # Table.
+    top = 390
+    left = 72
+    right = W-72
+    header_h = 115
+    row_h = 145
+    bottom = top + header_h + row_h*10
+    draw.rounded_rectangle((left, top, right, bottom), radius=25, fill=panel, outline=gold, width=6)
 
-    # Column coordinates.
-    cols = [left, 170, 520, 760, 930, 1110, right]
+    cols = [left, 190, 610, 895, 1090, 1330, right]
     headers = ["RANK", "BETTOR", "NET PROFIT", "RECORD", "WAGERED", "BALANCE"]
-    draw.rectangle((left+4, top+4, right-4, top+100), fill=(22, 22, 26))
-    draw.line((left, top+100, right, top+100), fill=gold, width=3)
+    draw.rectangle((left+5, top+5, right-5, top+header_h), fill=(20, 20, 25))
+    draw.line((left, top+header_h, right, top+header_h), fill=gold, width=4)
     for x in cols[1:-1]:
         draw.line((x, top, x, bottom), fill=line, width=2)
     for i, label in enumerate(headers):
-        _draw_centered(draw, (cols[i]+5, top+20, cols[i+1]-5, top+83), label, small_font, fill=gold2, stroke=1)
+        _draw_centered(draw, (cols[i]+5, top+22, cols[i+1]-5, top+92), label, header_font, fill=gold2, stroke=1)
 
-    row_h = 98
-    y = top + 100
+    y = top + header_h
     for idx in range(10):
         y1 = y + idx*row_h
         y2 = y1 + row_h
         if idx % 2 == 0:
-            draw.rectangle((left+4, y1, right-4, y2), fill=dark)
-        draw.line((left, y2, right, y2), fill=(72, 58, 31), width=1)
+            draw.rectangle((left+5, y1, right-5, y2), fill=dark)
+        draw.line((left, y2, right, y2), fill=(76, 60, 31), width=1)
+
+        # Always show the numbered ladder.
+        rank_color = gold2 if idx == 0 else (225,225,228) if idx == 1 else (194,128,72) if idx == 2 else (150,150,156)
+        _draw_centered(draw, (cols[0], y1, cols[1], y2), str(idx+1), rank_font, fill=rank_color, stroke=1)
 
         if idx >= len(rows):
-            _draw_centered(draw, (cols[0], y1, cols[1], y2), str(idx+1), rank_font, fill=(95, 95, 100), stroke=1)
             continue
 
         r = rows[idx]
@@ -11848,22 +11865,25 @@ def _sportsbook_leaderboard_image(rows):
         losses = int(r["losses"] or 0)
         total = wins + losses
         pct = (wins / total * 100) if total else 0
-        rank_text = "1" if idx == 0 else str(idx+1)
-        rank_color = gold2 if idx == 0 else (220,220,220) if idx == 1 else (190,120,65) if idx == 2 else white
-        _draw_centered(draw, (cols[0], y1, cols[1], y2), rank_text, rank_font, fill=rank_color, stroke=1)
 
-        name = str(r["display_name"] or "Unknown")
-        name_font = _fit_font(draw, name, cols[2]-cols[1]-24, 31, 20)
-        _draw_centered(draw, (cols[1]+10, y1, cols[2]-10, y2), name, name_font, fill=white, stroke=1)
-        _draw_centered(draw, (cols[2]+6, y1, cols[3]-6, y2), _sportsbook_money(r["net_profit"]), body_font, fill=gold2 if int(r["net_profit"] or 0) >= 0 else (235,90,90), stroke=1)
-        _draw_centered(draw, (cols[3]+4, y1, cols[4]-4, y2), f"{wins}W-{losses}L\n{pct:.0f}%", body_reg, fill=white, stroke=1)
-        _draw_centered(draw, (cols[4]+4, y1, cols[5]-4, y2), _sportsbook_money(r["total_wagered"]), body_reg, fill=white, stroke=1)
-        _draw_centered(draw, (cols[5]+4, y1, cols[6]-4, y2), _sportsbook_money(r["available_balance"]), body_reg, fill=white, stroke=1)
+        name = clean_name(r["display_name"])
+        name_font = _fit_font(draw, name, cols[2]-cols[1]-36, 43, 28)
+        _draw_centered(draw, (cols[1]+14, y1, cols[2]-14, y2), name, name_font, fill=white, stroke=1)
+        _draw_centered(draw, (cols[2]+8, y1, cols[3]-8, y2), _sportsbook_money(r["net_profit"]), body_font,
+                       fill=gold2 if int(r["net_profit"] or 0) >= 0 else (238, 94, 94), stroke=1)
+        _draw_centered(draw, (cols[3]+5, y1+18, cols[4]-5, y2-18), f"{wins}W-{losses}L\n{pct:.0f}%", body_reg, fill=white, stroke=1)
+        _draw_centered(draw, (cols[4]+5, y1, cols[5]-5, y2), _sportsbook_money(r["total_wagered"]), body_reg, fill=white, stroke=1)
+        _draw_centered(draw, (cols[5]+5, y1, cols[6]-5, y2), _sportsbook_money(r["available_balance"]), body_reg, fill=white, stroke=1)
 
-    # Bottom belt-style information plate.
-    draw.rounded_rectangle((145, 1480, W-145, 1560), radius=22, fill=(18,18,22), outline=gold, width=3)
-    _draw_centered(draw, (170, 1493, W-170, 1533), "RANKED BY TOTAL SPORTSBOOK PROFIT", small_font, fill=gold2, stroke=1)
-    _draw_centered(draw, (170, 1525, W-170, 1553), "REFUNDS DO NOT COUNT AS WINS OR LOSSES", _load_osbl_font(22, bold=True), fill=silver, stroke=1)
+    # Bottom information plate.
+    plate_y1 = bottom + 55
+    plate_y2 = plate_y1 + 130
+    draw.rounded_rectangle((135, plate_y1, W-135, plate_y2), radius=25, fill=(18,18,22), outline=gold, width=4)
+    _draw_centered(draw, (170, plate_y1+20, W-170, plate_y1+70), "RANKED BY TOTAL SPORTSBOOK PROFIT", _load_osbl_font(31, bold=True), fill=gold2, stroke=1)
+    _draw_centered(draw, (170, plate_y1+68, W-170, plate_y2-12), "REFUNDS DO NOT COUNT AS WINS OR LOSSES", _load_osbl_font(27, bold=True), fill=silver, stroke=1)
+
+    # Small footer gives the live board a finished fight-promotion look.
+    _draw_centered(draw, (100, H-105, W-100, H-55), "ONE LEAGUE • ONE STANDARD • ONE CHAMPION", _load_osbl_font(29, bold=True), fill=gold2, stroke=1)
 
     buf = io.BytesIO()
     image.save(buf, format="PNG", optimize=True)
