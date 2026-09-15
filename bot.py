@@ -275,10 +275,59 @@ class OSBLBot(commands.Bot):
                 CREATE TABLE IF NOT EXISTS gym_settings (
                     official_name TEXT PRIMARY KEY,
                     promoter_name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    registration_fee BIGINT NOT NULL DEFAULT 2000000,
+                    payment_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    activated_by_id BIGINT,
+                    activated_by_name TEXT,
+                    activated_at TIMESTAMPTZ,
+                    status_reason TEXT,
+                    status_changed_by_id BIGINT,
+                    status_changed_by_name TEXT,
+                    status_changed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_by_id BIGINT,
                     updated_by_name TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+            """)
+
+            # Safe migration for databases created before the dynamic gym registry.
+            for ddl in (
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE'",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS aliases_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS registration_fee BIGINT NOT NULL DEFAULT 2000000",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS payment_verified BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS activated_by_id BIGINT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS activated_by_name TEXT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_reason TEXT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_changed_by_id BIGINT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_changed_by_name TEXT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            ):
+                await conn.execute(ddl)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS gym_registry_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    gym_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    old_status TEXT,
+                    new_status TEXT,
+                    promoter_name TEXT,
+                    details TEXT,
+                    staff_id BIGINT NOT NULL,
+                    staff_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS gym_registry_log_gym_idx
+                ON gym_registry_log (gym_name, created_at DESC);
             """)
 
             await conn.execute("""
@@ -641,20 +690,43 @@ class OSBLBot(commands.Bot):
             """)
 
             default_gyms = [
-                ("RADEEMERS", "Dub Radeem"),
-                ("ROYAL HITTAZ", "Stormi North"),
-                ("FINESSE TOWN FIGHTERS", "Cheeda Finessa"),
-                ("GROVE STREET GOATS", "Mr. Souls"),
+                ("RADEEMERS", "Dub Radeem", json.dumps(["radeemers", "radeemers gym", "radeemer gym", "radeem team", "the radeem team"])),
+                ("ROYAL HITTAZ", "Stormi North", json.dumps(["royal hittaz", "royal hittaz gym", "royal hittaz fight gym", "royal hitttaz"])),
+                ("FINESSE TOWN FIGHTERS", "Cheeda Finessa", json.dumps(["finesse town fighters", "finesse town fighters gym", "finesse town gym", "finesse town"])),
+                ("GROVE STREET GOATS", "Mr. Souls", json.dumps(["grove street goats", "grove street goats gym", "grove street goatz", "grove street"])),
             ]
             await conn.executemany(
                 """
-                INSERT INTO gym_settings (official_name, promoter_name)
-                VALUES ($1, $2)
-                ON CONFLICT (official_name) DO NOTHING
+                INSERT INTO gym_settings (
+                    official_name, promoter_name, status, aliases_json,
+                    registration_fee, payment_verified, activated_at
+                )
+                VALUES ($1, $2, 'ACTIVE', $3, 2000000, TRUE, NOW())
+                ON CONFLICT (official_name) DO UPDATE SET
+                    aliases_json = CASE
+                        WHEN gym_settings.aliases_json IS NULL OR gym_settings.aliases_json = '[]'
+                        THEN EXCLUDED.aliases_json
+                        ELSE gym_settings.aliases_json
+                    END,
+                    status = COALESCE(gym_settings.status, 'ACTIVE'),
+                    registration_fee = COALESCE(gym_settings.registration_fee, 2000000)
                 """,
                 default_gyms,
             )
 
+            # Existing founding gyms are grandfathered into the paid/active registry.
+            await conn.execute(
+                """
+                UPDATE gym_settings
+                SET payment_verified = TRUE,
+                    status = 'ACTIVE',
+                    activated_at = COALESCE(activated_at, NOW())
+                WHERE official_name = ANY($1::text[])
+                """,
+                [row[0] for row in default_gyms],
+            )
+
+        await _refresh_official_gym_cache()
         normalization = await _normalize_existing_gym_data()
         print(
             "🧹 OSBL Gym Normalization Ready — "
@@ -786,11 +858,12 @@ async def osbl(ctx):
 POSTER_RENDERER_VERSION = "V9-CLEAN-BOOKING-SESSION-2026-09-09"
 RANKINGS_SYSTEM_VERSION = "V1-AUTO-RANKINGS-2026-09-08"
 FIGHTER_PROFILE_VERSION = "V3-OFFICIAL-FIGHTER-CARDS-2026-09-08"
-GYM_SYSTEM_VERSION = "V1-GYM-STANDINGS-2026-09-08"
+GYM_SYSTEM_VERSION = "V2-DYNAMIC-GYM-STANDINGS-2026-09-15"
 GYM_POSTER_VERSION = "V2-CLEAN-GYM-POSTERS-2026-09-08"
 GYM_MANAGEMENT_VERSION = "V1-GYM-MANAGEMENT-2026-09-08"
 GYM_HISTORY_VERSION = "V1-GYM-HISTORY-2026-09-08"
 GYM_NORMALIZATION_VERSION = "V1-GYM-NORMALIZATION-2026-09-09"
+GYM_REGISTRY_VERSION = "V1-DYNAMIC-GYM-REGISTRY-2026-09-15"
 FIGHTER_DUPLICATE_VERSION = "V2-FUZZY-DUPLICATE-CHECK-2026-09-09"
 FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
@@ -828,6 +901,7 @@ async def systemcheck(ctx):
         "fight_night_staff_assignments",
         "fight_bookings",
         "gym_settings",
+        "gym_registry_log",
         "gym_management_log",
         "gym_season_history",
         "test_cleanup_audit_log",
@@ -957,6 +1031,12 @@ async def systemcheck(ctx):
         "top10",
         "fighter",
         "fightercard",
+        "activategym",
+        "gymstatus",
+        "setgymstatus",
+        "deactivategym",
+        "officialgyms",
+        "setgymaliases",
         "setgym",
         "removegym",
         "setpromoter",
@@ -1080,6 +1160,12 @@ async def systemcheck(ctx):
     embed.add_field(
         name="🏢 Gym System",
         value=f"**{GYM_SYSTEM_VERSION}**",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🗂️ Gym Registry",
+        value=f"**{GYM_REGISTRY_VERSION}**",
         inline=False,
     )
 
@@ -1877,6 +1963,12 @@ async def matchupcheck(ctx, *, details: str = None):
         ),
         inline=False,
     )
+    gym_issues = [issue for issue in (await _fighter_gym_competition_issue(fighter1), await _fighter_gym_competition_issue(fighter2)) if issue]
+    embed.add_field(
+        name="🏢 Gym Eligibility",
+        value="✅ Both fighters are clear for current OSBL competition." if not gym_issues else "⚠️ " + "\n".join(gym_issues),
+        inline=False,
+    )
     embed.add_field(
         name="✅ Regular Fight",
         value="Eligible — same division.",
@@ -1913,6 +2005,11 @@ async def bookfight(ctx, *, details: str = None):
     fighter1, fighter2, error = await _matchup_snapshot(parts[0], parts[1])
     if error:
         await ctx.send(error)
+        return
+
+    gym_issues = [issue for issue in (await _fighter_gym_competition_issue(fighter1), await _fighter_gym_competition_issue(fighter2)) if issue]
+    if gym_issues:
+        await ctx.send("❌ **BOOKING BLOCKED — GYM STATUS**\n" + "\n".join(gym_issues))
         return
 
     bout_type = "regular"
@@ -5810,28 +5907,54 @@ async def fighters(ctx, *, division: str = None):
 # !gymstandings
 # =========================================================
 
-OFFICIAL_GYMS = {
-    "RADEEMERS": {
-        "promoter": "Dub Radeem",
-        "aliases": ("radeemers", "radeemers gym", "radeemer gym", "radeem team", "the radeem team"),
-    },
-    "ROYAL HITTAZ": {
-        "promoter": "Stormi North",
-        "aliases": ("royal hittaz", "royal hittaz gym", "royal hittaz fight gym", "royal hitttaz"),
-    },
-    "FINESSE TOWN FIGHTERS": {
-        "promoter": "Cheeda Finessa",
-        "aliases": ("finesse town fighters", "finesse town fighters gym", "finesse town gym", "finesse town"),
-    },
-    "GROVE STREET GOATS": {
-        "promoter": "Mr. Souls",
-        "aliases": ("grove street goats", "grove street goats gym", "grove street goatz", "grove street"),
-    },
-}
+# DB-backed registry cache. Founding gyms are seeded at startup; newly approved gyms
+# are added by !activategym and immediately become available to every gym command.
+OFFICIAL_GYMS = {}
+VALID_GYM_STATUSES = ("ACTIVE", "INACTIVE", "SUSPENDED", "RETIRED")
+GYM_REGISTRATION_FEE = 2_000_000
 
 
 def _norm_gym_text(value):
     return " ".join(str(value or "").casefold().strip().split())
+
+
+def _default_dynamic_aliases(official_name):
+    name = " ".join(str(official_name or "").strip().split())
+    base = _norm_gym_text(name)
+    aliases = {base}
+    if base and not base.endswith(" gym"):
+        aliases.add(f"{base} gym")
+    return sorted(x for x in aliases if x)
+
+
+async def _refresh_official_gym_cache():
+    rows = await bot.db.fetch(
+        """
+        SELECT official_name, promoter_name, status, aliases_json,
+               registration_fee, payment_verified
+        FROM gym_settings
+        ORDER BY official_name ASC
+        """
+    )
+    cache = {}
+    for row in rows:
+        try:
+            aliases = json.loads(row["aliases_json"] or "[]")
+            if not isinstance(aliases, list):
+                aliases = []
+        except Exception:
+            aliases = []
+        aliases = list(dict.fromkeys(_default_dynamic_aliases(row["official_name"]) + [str(x) for x in aliases if str(x).strip()]))
+        cache[row["official_name"]] = {
+            "promoter": row["promoter_name"],
+            "aliases": tuple(aliases),
+            "status": str(row["status"] or "ACTIVE").upper(),
+            "registration_fee": int(row["registration_fee"] or GYM_REGISTRATION_FEE),
+            "payment_verified": bool(row["payment_verified"]),
+        }
+    OFFICIAL_GYMS.clear()
+    OFFICIAL_GYMS.update(cache)
+    return len(cache)
 
 
 def _resolve_official_gym(value):
@@ -5841,15 +5964,28 @@ def _resolve_official_gym(value):
     for official, meta in OFFICIAL_GYMS.items():
         if key == _norm_gym_text(official):
             return official
-        if key in {_norm_gym_text(x) for x in meta["aliases"]}:
+        if key in {_norm_gym_text(x) for x in meta.get("aliases", ())}:
             return official
     return None
 
 
+def _gym_status_cached(official_gym):
+    meta = OFFICIAL_GYMS.get(official_gym) or {}
+    return str(meta.get("status") or "ACTIVE").upper()
+
+
+def _gym_is_active(official_gym):
+    return _gym_status_cached(official_gym) == "ACTIVE"
+
+
+def _active_official_gym_names():
+    return [name for name in OFFICIAL_GYMS if _gym_is_active(name)]
+
+
 async def _normalize_existing_gym_data():
     """
-    Canonicalize existing official gym names without touching test gyms,
-    independent fighters, or unrelated promotions.
+    Canonicalize registered gym names without touching independent fighters or
+    unrelated promotions. Registry aliases make this work for newly approved gyms too.
     """
     fighter_rows = await bot.db.fetch(
         "SELECT fighter_key, fighter_name, gym FROM fighters"
@@ -5900,31 +6036,41 @@ async def _normalize_existing_gym_data():
 
 
 async def _gym_promoter(official_gym):
-    try:
-        promoter = await bot.db.fetchval(
-            "SELECT promoter_name FROM gym_settings WHERE official_name = $1",
-            official_gym,
-        )
-        if promoter:
-            return promoter
-    except Exception:
-        pass
-    return OFFICIAL_GYMS[official_gym]["promoter"]
+    meta = OFFICIAL_GYMS.get(official_gym)
+    if meta and meta.get("promoter"):
+        return meta["promoter"]
+    promoter = await bot.db.fetchval(
+        "SELECT promoter_name FROM gym_settings WHERE official_name = $1",
+        official_gym,
+    )
+    return promoter or "Unassigned"
 
 
 def _fighter_belongs_to_gym(raw_gym, official_gym):
     raw = _norm_gym_text(raw_gym)
     if not raw:
         return False
-    meta = OFFICIAL_GYMS[official_gym]
-    accepted = {_norm_gym_text(official_gym)} | {_norm_gym_text(x) for x in meta["aliases"]}
-    # Allow common stored variants like "RADEEMERS Gym" while avoiding unrelated partial matches.
+    meta = OFFICIAL_GYMS.get(official_gym) or {}
+    accepted = {_norm_gym_text(official_gym)} | {_norm_gym_text(x) for x in meta.get("aliases", ())}
     return raw in accepted
 
 
 async def _gym_fighters(official_gym):
-    rows = await bot.db.fetch("SELECT * FROM fighters ORDER BY division, rp DESC, wins DESC, fighter_name ASC")
-    return [row for row in rows if _fighter_belongs_to_gym(row["gym"], official_gym)]
+    # Canonical names are stored after activation/setgym, so this query scales to
+    # any newly approved gym without hard-coding names in Python.
+    rows = await bot.db.fetch(
+        """
+        SELECT * FROM fighters
+        WHERE LOWER(TRIM(gym)) = LOWER(TRIM($1))
+        ORDER BY division, rp DESC, wins DESC, fighter_name ASC
+        """,
+        official_gym,
+    )
+    if rows:
+        return rows
+    # Compatibility fallback for legacy alias-stored rows.
+    all_rows = await bot.db.fetch("SELECT * FROM fighters ORDER BY division, rp DESC, wins DESC, fighter_name ASC")
+    return [row for row in all_rows if _fighter_belongs_to_gym(row["gym"], official_gym)]
 
 
 async def _gym_snapshot(official_gym):
@@ -5981,9 +6127,13 @@ async def _gym_snapshot(official_gym):
     }
     gym_points = sum(point_parts.values())
 
+    meta = OFFICIAL_GYMS.get(official_gym) or {}
     return {
         "official_name": official_gym,
         "promoter": await _gym_promoter(official_gym),
+        "status": _gym_status_cached(official_gym),
+        "payment_verified": bool(meta.get("payment_verified", False)),
+        "registration_fee": int(meta.get("registration_fee", GYM_REGISTRATION_FEE)),
         "fighters": fighters,
         "roster_size": len(fighters),
         "wins": wins,
@@ -6003,11 +6153,11 @@ async def _gym_snapshot(official_gym):
     }
 
 
-async def _all_gym_snapshots():
-    snapshots = []
-    for gym_name in OFFICIAL_GYMS:
-        snapshots.append(await _gym_snapshot(gym_name))
-    snapshots.sort(
+async def _all_gym_snapshots(include_inactive=False):
+    names = list(OFFICIAL_GYMS) if include_inactive else _active_official_gym_names()
+    snapshots = [await _gym_snapshot(gym_name) for gym_name in names]
+    active = [g for g in snapshots if g["status"] == "ACTIVE"]
+    active.sort(
         key=lambda g: (
             -g["gym_points"],
             -len(g["champions"]),
@@ -6016,20 +6166,35 @@ async def _all_gym_snapshots():
             g["official_name"],
         )
     )
-    for index, snapshot in enumerate(snapshots, start=1):
-        snapshot["gym_rank"] = index
-    return snapshots
+    active_rank = {g["official_name"]: idx for idx, g in enumerate(active, start=1)}
+    for snapshot in snapshots:
+        snapshot["gym_rank"] = active_rank.get(snapshot["official_name"])
+    if include_inactive:
+        snapshots.sort(key=lambda g: (g["status"] != "ACTIVE", active_rank.get(g["official_name"], 999999), g["official_name"]))
+        return snapshots
+    return active
 
 
-def _gym_usage():
-    return (
-        "❌ Use one of the official gym names:\n"
-        "**RADEEMERS**\n"
-        "**ROYAL HITTAZ**\n"
-        "**FINESSE TOWN FIGHTERS**\n"
-        "**GROVE STREET GOATS**"
-    )
+def _gym_usage(active_only=False):
+    names = _active_official_gym_names() if active_only else list(OFFICIAL_GYMS)
+    if not names:
+        return "❌ No OSBL gyms are currently registered."
+    lines = []
+    for name in names:
+        status = _gym_status_cached(name)
+        suffix = "" if active_only else f" — {status}"
+        lines.append(f"**{name}**{suffix}")
+    return "❌ Use one of the registered OSBL gym names:\n" + "\n".join(lines)
 
+
+async def _fighter_gym_competition_issue(fighter_row):
+    official = _resolve_official_gym(fighter_row.get("gym") if hasattr(fighter_row, "get") else fighter_row["gym"])
+    if not official:
+        return None
+    status = _gym_status_cached(official)
+    if status == "ACTIVE":
+        return None
+    return f"**{fighter_row['fighter_name']}** is assigned to **{official}**, which is currently **{status}**. Reassign the fighter or reactivate the gym before booking."
 
 GYM_POSTER_TEMPLATES = {
     "ROYAL HITTAZ": "osbl_gym_royal_hittaz.png",
@@ -6043,12 +6208,27 @@ def _render_gym_poster(snapshot):
     from PIL import Image, ImageDraw
 
     official = snapshot["official_name"]
-    filename = GYM_POSTER_TEMPLATES[official]
-    path = Path(__file__).resolve().parent / filename
-    if not path.exists():
-        raise FileNotFoundError(f"Missing gym poster template: {filename}")
+    filename = GYM_POSTER_TEMPLATES.get(official)
+    path = Path(__file__).resolve().parent / filename if filename else None
 
-    image = Image.open(path).convert("RGB")
+    if path and path.exists():
+        image = Image.open(path).convert("RGB")
+    else:
+        # Newly approved gyms get a clean universal OSBL black/gold poster until
+        # a custom team template is added later.
+        image = Image.new("RGB", (1200, 1600), (8, 8, 10))
+        base_draw = ImageDraw.Draw(image, "RGBA")
+        base_draw.rounded_rectangle((35, 35, 1165, 1565), radius=28, outline=(218, 177, 62, 255), width=5)
+        base_draw.rounded_rectangle((70, 90, 1130, 410), radius=22, fill=(12, 12, 15, 245), outline=(218, 177, 62, 255), width=3)
+        name_font = _fit_font(base_draw, official, 980, 78, 34)
+        _draw_centered(base_draw, (100, 145, 1100, 270), official, name_font, fill=(245, 245, 245), stroke=2)
+        sub_font = _fit_font(base_draw, "OFFICIAL OSBL GYM", 700, 42, 22)
+        _draw_centered(base_draw, (160, 280, 1040, 355), "OFFICIAL OSBL GYM", sub_font, fill=(232, 188, 80), stroke=1)
+        promoter_font = _fit_font(base_draw, f"PROMOTER: {snapshot['promoter']}", 900, 34, 18)
+        _draw_centered(base_draw, (120, 430, 1080, 500), f"PROMOTER: {snapshot['promoter']}", promoter_font, fill=(230, 230, 230), stroke=1)
+        status_font = _fit_font(base_draw, f"STATUS: {snapshot['status']}", 700, 32, 18)
+        _draw_centered(base_draw, (180, 505, 1020, 570), f"STATUS: {snapshot['status']}", status_font, fill=(232, 188, 80), stroke=1)
+
     draw = ImageDraw.Draw(image, "RGBA")
     w, h = image.size
 
@@ -6076,7 +6256,7 @@ def _render_gym_poster(snapshot):
     )
 
     stats = [
-        ("GYM RANK", f"#{snapshot['gym_rank']}"),
+        ("GYM RANK", f"#{snapshot['gym_rank']}" if snapshot.get("gym_rank") else "—"),
         ("GYM POINTS", str(snapshot['gym_points'])),
         ("RECORD", f"{snapshot['wins']}-{snapshot['losses']}"),
         ("TOTAL RP", str(snapshot['total_rp'])),
@@ -6120,7 +6300,7 @@ def _render_gym_poster(snapshot):
 
 
 async def _send_gym_poster(ctx, official):
-    snapshots = await _all_gym_snapshots()
+    snapshots = await _all_gym_snapshots(include_inactive=True)
     g = next(x for x in snapshots if x["official_name"] == official)
     poster = _render_gym_poster(g)
     attachment_name = "osbl_" + official.casefold().replace(" ", "_") + "_gym_poster.png"
@@ -6128,7 +6308,7 @@ async def _send_gym_poster(ctx, official):
     embed = discord.Embed(
         title=f"🏢 OSBL OFFICIAL GYM BANNER — {official}",
         description=(
-            f"**Gym Rank #{g['gym_rank']} • {g['gym_points']} GP**\n"
+            f"**Status: {g['status']} • Gym Rank {('#' + str(g['gym_rank'])) if g['gym_rank'] else '—'} • {g['gym_points']} GP**\n"
             f"Leader / Promoter: **{g['promoter']}** • Record **{g['wins']}-{g['losses']}** • **{g['total_rp']} RP**"
         ),
         color=discord.Color.gold(),
@@ -6167,6 +6347,291 @@ async def _log_gym_management(ctx, action, fighter_row=None, old_value=None, new
     )
 
 
+
+async def _log_gym_registry(ctx, gym_name, action, old_status=None, new_status=None, promoter_name=None, details=None):
+    await bot.db.execute(
+        """
+        INSERT INTO gym_registry_log (
+            gym_name, action, old_status, new_status, promoter_name,
+            details, staff_id, staff_name
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        """,
+        gym_name, action, old_status, new_status, promoter_name,
+        details, ctx.author.id, ctx.author.display_name,
+    )
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def activategym(ctx, *, details: str = None):
+    """Activate an approved gym and attach its opening roster in one transaction."""
+    if not details:
+        await ctx.send(
+            "❌ **GYM ACTIVATION FORMAT**\n"
+            "`!activategym Gym Name | Promoter Name | Fighter 1 | Fighter 2 | Fighter 3`\n"
+            "Add more fighters as extra `| Fighter Name` entries if needed."
+        )
+        return
+
+    parts = [p.strip() for p in details.split("|") if p.strip()]
+    if len(parts) < 5:
+        await ctx.send(
+            "❌ Gym activation requires a **gym name, promoter, and at least 3 fighters**.\n"
+            "`!activategym Gym Name | Promoter Name | Fighter 1 | Fighter 2 | Fighter 3`"
+        )
+        return
+
+    requested_name, promoter_name = parts[0], parts[1]
+    fighter_names = parts[2:]
+    official_name = " ".join(requested_name.upper().split())
+    if len({_fighter_key_from_name(x) for x in fighter_names}) < 3:
+        await ctx.send("❌ The opening roster must contain at least **3 different fighters**.")
+        return
+
+    fighter_rows = []
+    missing = []
+    for fighter_name in fighter_names:
+        row = await bot.db.fetchrow(
+            "SELECT * FROM fighters WHERE fighter_key = $1",
+            _fighter_key_from_name(fighter_name),
+        )
+        if row:
+            fighter_rows.append(row)
+        else:
+            missing.append(fighter_name)
+    if missing:
+        await ctx.send(
+            "❌ **GYM ACTIVATION BLOCKED — unregistered fighter(s):**\n"
+            + "\n".join(f"• {name}" for name in missing)
+            + "\n\nRegister these fighters first, then run `!activategym` again."
+        )
+        return
+
+    existing = _resolve_official_gym(official_name)
+    official = existing or official_name
+    old_status = _gym_status_cached(official) if existing else None
+    aliases = _default_dynamic_aliases(official)
+
+    async with bot.db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO gym_settings (
+                    official_name, promoter_name, status, aliases_json,
+                    registration_fee, payment_verified,
+                    activated_by_id, activated_by_name, activated_at,
+                    status_reason, status_changed_by_id, status_changed_by_name,
+                    status_changed_at, updated_by_id, updated_by_name, updated_at
+                )
+                VALUES ($1,$2,'ACTIVE',$3,$4,TRUE,$5,$6,NOW(),
+                        'Final OSBL approval / activation',$5,$6,NOW(),$5,$6,NOW())
+                ON CONFLICT (official_name)
+                DO UPDATE SET
+                    promoter_name = EXCLUDED.promoter_name,
+                    status = 'ACTIVE',
+                    registration_fee = EXCLUDED.registration_fee,
+                    payment_verified = TRUE,
+                    activated_by_id = EXCLUDED.activated_by_id,
+                    activated_by_name = EXCLUDED.activated_by_name,
+                    activated_at = NOW(),
+                    status_reason = 'Final OSBL approval / activation',
+                    status_changed_by_id = EXCLUDED.status_changed_by_id,
+                    status_changed_by_name = EXCLUDED.status_changed_by_name,
+                    status_changed_at = NOW(),
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                official, promoter_name, json.dumps(aliases), GYM_REGISTRATION_FEE,
+                ctx.author.id, ctx.author.display_name,
+            )
+
+            for row in fighter_rows:
+                old_gym = str(row["gym"] or "").strip() or "Independent / No Gym Assigned"
+                await conn.execute(
+                    "UPDATE fighters SET gym = $1, updated_at = NOW() WHERE fighter_key = $2",
+                    official, row["fighter_key"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO gym_management_log (
+                        action, fighter_key, fighter_name, old_value, new_value,
+                        staff_id, staff_name
+                    ) VALUES ('ACTIVATION_ROSTER_ASSIGNMENT',$1,$2,$3,$4,$5,$6)
+                    """,
+                    row["fighter_key"], row["fighter_name"], old_gym, official,
+                    ctx.author.id, ctx.author.display_name,
+                )
+
+            await conn.execute(
+                """
+                INSERT INTO gym_registry_log (
+                    gym_name, action, old_status, new_status, promoter_name,
+                    details, staff_id, staff_name
+                ) VALUES ($1,'ACTIVATE_GYM',$2,'ACTIVE',$3,$4,$5,$6)
+                """,
+                official, old_status, promoter_name,
+                f"Opening roster: {', '.join(row['fighter_name'] for row in fighter_rows)}; fee verified: ${GYM_REGISTRATION_FEE:,}",
+                ctx.author.id, ctx.author.display_name,
+            )
+
+    await _refresh_official_gym_cache()
+    snapshot = await _gym_snapshot(official)
+    embed = discord.Embed(
+        title="🥊 OSBL GYM ACTIVATED",
+        description=f"**{official}** is now an **ACTIVE official OSBL gym**.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="🎙️ Promoter", value=promoter_name, inline=True)
+    embed.add_field(name="💰 Registration", value=f"${GYM_REGISTRATION_FEE:,} • VERIFIED", inline=True)
+    embed.add_field(name="👥 Opening Roster", value="\n".join(f"• {r['fighter_name']}" for r in fighter_rows), inline=False)
+    embed.add_field(name="📊 League Integration", value="Gym standings • rankings/records • Fight Night eligibility • roster management • payouts/history", inline=False)
+    embed.set_footer(text=f"{GYM_REGISTRY_VERSION} • Activated by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def gymstatus(ctx, *, gym_name: str = None):
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    row = await bot.db.fetchrow("SELECT * FROM gym_settings WHERE official_name = $1", official)
+    roster_count = await bot.db.fetchval("SELECT COUNT(*) FROM fighters WHERE LOWER(TRIM(gym)) = LOWER(TRIM($1))", official)
+    status = str(row["status"] or "ACTIVE").upper()
+    status_icon = {"ACTIVE":"🟢", "INACTIVE":"⚪", "SUSPENDED":"🟠", "RETIRED":"⚫"}.get(status, "⚪")
+    embed = discord.Embed(
+        title=f"🏢 OSBL GYM STATUS — {official}",
+        description=f"{status_icon} **{status}**",
+        color=discord.Color.green() if status == "ACTIVE" else discord.Color.orange(),
+    )
+    embed.add_field(name="🎙️ Promoter", value=row["promoter_name"], inline=True)
+    embed.add_field(name="👥 Roster", value=str(roster_count), inline=True)
+    embed.add_field(name="💰 Registration Fee", value=f"${int(row['registration_fee'] or GYM_REGISTRATION_FEE):,}", inline=True)
+    embed.add_field(name="Payment Verified", value="YES" if row["payment_verified"] else "NO", inline=True)
+    embed.add_field(name="Current Competition", value="Included" if status == "ACTIVE" else "Excluded from active gym standings / new gym-based bookings", inline=False)
+    if row["status_reason"]:
+        embed.add_field(name="Status Note", value=row["status_reason"], inline=False)
+    embed.set_footer(text=GYM_REGISTRY_VERSION)
+    await ctx.send(embed=embed)
+
+
+async def _set_gym_status_internal(ctx, official, new_status, reason):
+    new_status = str(new_status or "").upper().strip()
+    if new_status not in VALID_GYM_STATUSES:
+        await ctx.send("❌ Status must be **ACTIVE, INACTIVE, SUSPENDED, or RETIRED**.")
+        return False
+    row = await bot.db.fetchrow("SELECT * FROM gym_settings WHERE official_name = $1", official)
+    if not row:
+        await ctx.send("❌ Gym registry record not found.")
+        return False
+    old_status = str(row["status"] or "ACTIVE").upper()
+    if new_status == "ACTIVE":
+        roster_count = await bot.db.fetchval("SELECT COUNT(*) FROM fighters WHERE LOWER(TRIM(gym)) = LOWER(TRIM($1))", official)
+        if roster_count < 3:
+            await ctx.send(f"❌ **{official}** cannot be ACTIVE with only **{roster_count}** rostered fighter(s). Minimum is 3.")
+            return False
+        if not row["payment_verified"]:
+            await ctx.send(f"❌ **{official}** cannot be ACTIVE until the **$2,000,000 registration payment** is verified.")
+            return False
+
+    await bot.db.execute(
+        """
+        UPDATE gym_settings
+        SET status = $1, status_reason = $2,
+            status_changed_by_id = $3, status_changed_by_name = $4,
+            status_changed_at = NOW(), updated_by_id = $3,
+            updated_by_name = $4, updated_at = NOW()
+        WHERE official_name = $5
+        """,
+        new_status, reason or "Status updated by OSBL Commissioner",
+        ctx.author.id, ctx.author.display_name, official,
+    )
+    await _log_gym_registry(ctx, official, "SET_GYM_STATUS", old_status, new_status, row["promoter_name"], reason)
+    await _refresh_official_gym_cache()
+    return True
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def setgymstatus(ctx, *, details: str = None):
+    if not details or "|" not in details:
+        await ctx.send("❌ Use: `!setgymstatus Gym Name | ACTIVE/INACTIVE/SUSPENDED/RETIRED | Optional reason`")
+        return
+    parts = [p.strip() for p in details.split("|", 2)]
+    official = _resolve_official_gym(parts[0])
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    status = parts[1]
+    reason = parts[2] if len(parts) > 2 else None
+    if not await _set_gym_status_internal(ctx, official, status, reason):
+        return
+    embed = discord.Embed(
+        title="🏢 OSBL GYM STATUS UPDATED",
+        description=f"**{official}** is now **{status.upper()}**.",
+        color=discord.Color.green() if status.upper() == "ACTIVE" else discord.Color.orange(),
+    )
+    embed.add_field(name="Reason", value=reason or "Commissioner status update", inline=False)
+    embed.set_footer(text=f"{GYM_REGISTRY_VERSION} • {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def deactivategym(ctx, *, details: str = None):
+    if not details:
+        await ctx.send("❌ Use: `!deactivategym Gym Name | Reason`")
+        return
+    parts = [p.strip() for p in details.split("|", 1)]
+    official = _resolve_official_gym(parts[0])
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    reason = parts[1] if len(parts) > 1 else "Inactive / removed from current OSBL competition"
+    if await _set_gym_status_internal(ctx, official, "INACTIVE", reason):
+        await ctx.send(f"⚪ **{official}** is now **INACTIVE**. Its roster/history is preserved, but it is removed from active gym standings and blocked from new gym-based bookings.")
+
+
+@bot.command()
+async def officialgyms(ctx):
+    await _refresh_official_gym_cache()
+    lines = []
+    icons = {"ACTIVE":"🟢", "INACTIVE":"⚪", "SUSPENDED":"🟠", "RETIRED":"⚫"}
+    for official in sorted(OFFICIAL_GYMS):
+        meta = OFFICIAL_GYMS[official]
+        status = meta.get("status", "ACTIVE")
+        roster = await bot.db.fetchval("SELECT COUNT(*) FROM fighters WHERE LOWER(TRIM(gym)) = LOWER(TRIM($1))", official)
+        lines.append(f"{icons.get(status,'⚪')} **{official}** — {status} • {meta.get('promoter','Unassigned')} • {roster} fighters")
+    embed = discord.Embed(title="🏢 OSBL OFFICIAL GYM REGISTRY", description="\n".join(lines) or "No gyms registered.", color=discord.Color.gold())
+    embed.set_footer(text=f"{GYM_REGISTRY_VERSION} • Active gyms compete in live standings")
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def setgymaliases(ctx, *, details: str = None):
+    if not details or "|" not in details:
+        await ctx.send("❌ Use: `!setgymaliases Gym Name | alias one, alias two, alias three`")
+        return
+    gym_name, alias_text = [p.strip() for p in details.split("|", 1)]
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    aliases = _default_dynamic_aliases(official)
+    aliases += [x.strip() for x in alias_text.split(",") if x.strip()]
+    aliases = list(dict.fromkeys(aliases))
+    await bot.db.execute(
+        "UPDATE gym_settings SET aliases_json=$1, updated_by_id=$2, updated_by_name=$3, updated_at=NOW() WHERE official_name=$4",
+        json.dumps(aliases), ctx.author.id, ctx.author.display_name, official,
+    )
+    await _refresh_official_gym_cache()
+    await _log_gym_registry(ctx, official, "SET_ALIASES", _gym_status_cached(official), _gym_status_cached(official), await _gym_promoter(official), ", ".join(aliases))
+    await ctx.send(f"✅ **{official}** aliases updated: " + ", ".join(f"`{a}`" for a in aliases))
+
+
 @bot.command()
 @commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def setgym(ctx, *, details: str = None):
@@ -6181,7 +6646,10 @@ async def setgym(ctx, *, details: str = None):
     fighter_name, gym_name = [part.strip() for part in details.split("|", 1)]
     official = _resolve_official_gym(gym_name)
     if not official:
-        await ctx.send(_gym_usage())
+        await ctx.send(_gym_usage(active_only=True))
+        return
+    if not _gym_is_active(official):
+        await ctx.send(f"❌ **{official}** is **{_gym_status_cached(official)}** and cannot receive new fighter assignments. Reactivate it first.")
         return
 
     fighter_key = _fighter_key_from_name(fighter_name)
@@ -6294,6 +6762,7 @@ async def setpromoter(ctx, *, details: str = None):
         ctx.author.display_name,
     )
     await _log_gym_management(ctx, "SET_PROMOTER", None, f"{official}: {old_promoter}", f"{official}: {promoter_name}")
+    await _refresh_official_gym_cache()
 
     embed = discord.Embed(
         title="🎙️ OSBL GYM PROMOTER UPDATED",
@@ -6324,12 +6793,14 @@ async def gymcheck(ctx, *, fighter_name: str = None):
     official = _resolve_official_gym(row["gym"])
     if official:
         promoter = await _gym_promoter(official)
-        snapshots = await _all_gym_snapshots()
+        snapshots = await _all_gym_snapshots(include_inactive=True)
         g = next(x for x in snapshots if x["official_name"] == official)
+        rank_text = f"#{g['gym_rank']}" if g.get("gym_rank") else "Not ranked"
         description = (
             f"**{row['fighter_name']}** is assigned to **{official}**.\n"
             f"Leader / Promoter: **{promoter}**\n"
-            f"Current Gym Rank: **#{g['gym_rank']}** • **{g['gym_points']} GP**"
+            f"Gym Status: **{g['status']}**\n"
+            f"Current Gym Rank: **{rank_text}** • **{g['gym_points']} GP**"
         )
     else:
         description = (
@@ -6366,7 +6837,7 @@ async def gymposter(ctx, *, gym_name: str = None):
 @bot.command()
 async def gymposterall(ctx):
     await ctx.send("🏢 **OSBL OFFICIAL GYM BANNERS** — refreshing live gym data...")
-    for official in OFFICIAL_GYMS:
+    for official in _active_official_gym_names():
         try:
             await _send_gym_poster(ctx, official)
         except Exception as exc:
@@ -6376,6 +6847,9 @@ async def gymposterall(ctx):
 @bot.command()
 async def gymstandings(ctx):
     snapshots = await _all_gym_snapshots()
+    if not snapshots:
+        await ctx.send("🏢 No ACTIVE OSBL gyms are currently in the live standings.")
+        return
     lines = []
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for g in snapshots:
@@ -6412,13 +6886,13 @@ async def gym(ctx, *, gym_name: str = None):
         await ctx.send(_gym_usage())
         return
 
-    snapshots = await _all_gym_snapshots()
+    snapshots = await _all_gym_snapshots(include_inactive=True)
     g = next(x for x in snapshots if x["official_name"] == official)
     champion_names = ", ".join(row["fighter_name"] for row in g["champions"]) or "None"
 
     embed = discord.Embed(
         title=f"🏢 OSBL OFFICIAL GYM PROFILE — {official}",
-        description=f"**Gym Rank #{g['gym_rank']}** • **{g['gym_points']} Gym Points**",
+        description=f"**Status: {g['status']} • Gym Rank {('#' + str(g['gym_rank'])) if g['gym_rank'] else '—'}** • **{g['gym_points']} Gym Points**",
         color=discord.Color.gold(),
     )
     embed.add_field(name="🎙️ Leader / Promoter", value=g["promoter"], inline=True)
@@ -6440,12 +6914,12 @@ async def gymstats(ctx, *, gym_name: str = None):
         await ctx.send(_gym_usage())
         return
 
-    snapshots = await _all_gym_snapshots()
+    snapshots = await _all_gym_snapshots(include_inactive=True)
     g = next(x for x in snapshots if x["official_name"] == official)
     parts = g["point_parts"]
     embed = discord.Embed(
         title=f"📊 OSBL GYM STATS — {official}",
-        description=f"**Gym Rank #{g['gym_rank']} • {g['gym_points']} GP**",
+        description=f"**Status: {g['status']} • Gym Rank {('#' + str(g['gym_rank'])) if g['gym_rank'] else '—'} • {g['gym_points']} GP**",
         color=discord.Color.gold(),
     )
     embed.add_field(
@@ -6488,7 +6962,7 @@ async def gymroster(ctx, *, gym_name: str = None):
     promoter = await _gym_promoter(official)
     embed = discord.Embed(
         title=f"🥊 {official} — OFFICIAL GYM ROSTER",
-        description=f"Leader / Promoter: **{promoter}**",
+        description=f"Leader / Promoter: **{promoter}**\nGym Status: **{_gym_status_cached(official)}**",
         color=discord.Color.gold(),
     )
 
@@ -6549,6 +7023,9 @@ async def archivegymseason(ctx, *, season_name: str = None):
         return
 
     snapshots = await _all_gym_snapshots()
+    if not snapshots:
+        await ctx.send("❌ No ACTIVE gyms are available to archive for this season.")
+        return
     async with bot.db.acquire() as conn:
         async with conn.transaction():
             for g in snapshots:
