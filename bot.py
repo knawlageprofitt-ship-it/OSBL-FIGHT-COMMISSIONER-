@@ -307,6 +307,8 @@ class OSBLBot(commands.Bot):
                 "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_changed_by_name TEXT",
                 "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ",
                 "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS promoter_discord_user_id BIGINT",
+                "ALTER TABLE gym_settings ADD COLUMN IF NOT EXISTS promoter_discord_display_name TEXT",
             ):
                 await conn.execute(ddl)
 
@@ -869,9 +871,10 @@ FIGHT_NIGHT_FINANCE_VERSION = "V2-FIGHT-NIGHT-FINANCE-SNAPSHOTS-2026-09-09"
 FIGHT_NIGHT_CLEANUP_VERSION = "V2-FIGHT-NIGHT-CLEANUP-2026-09-09"
 FIGHT_NIGHT_STAFF_VERSION = "V1-FIGHT-NIGHT-STAFF-ASSIGNMENTS-2026-09-09"
 JOB_COMMAND_GUIDE_VERSION = "V1-JOB-COMMAND-GUIDES-2026-09-09"
-JOB_PERMISSION_ENFORCEMENT_VERSION = "V2-JOB-PERMISSION-FIX-2026-09-10"
+JOB_PERMISSION_ENFORCEMENT_VERSION = "V3-ACADEMY-PERMISSIONS-2026-09-21"
 STAFF_NAME_ASSIGNMENT_VERSION = "V1-DISPLAY-NAME-STAFF-ASSIGNMENT-2026-09-10"
 STAFF_DISPLAY_OUTPUT_VERSION = "V2-PLAIN-DISPLAY-NAME-OUTPUT-2026-09-10"
+PROMOTER_PHOTO_PERMISSION_VERSION = "V1-OWN-GYM-PHOTO-ACCESS-2026-09-21"
 CLEANUP_SYSTEM_VERSION = "V1-TEST-CLEANUP-2026-09-08"
 DATABASE_BACKUP_VERSION = "V1-DATABASE-BACKUP-2026-09-08"
 PAYOUT_SYSTEM_VERSION = "V5-TREASURY-DASHBOARD-2026-09-09"
@@ -1026,6 +1029,8 @@ async def systemcheck(ctx):
         "setfighterphoto",
         "fighterphoto",
         "removefighterphoto",
+        "linkpromoterdiscord",
+        "promoterdiscord",
         "rankings",
         "allrankings",
         "top10",
@@ -2265,6 +2270,16 @@ OSBL_FIGHT_NIGHT_JOBS = {
         "emoji": "🎨",
         "description": "Generates and posts fight-card posters and other public Fight Night graphics.",
     },
+    "sportsbook": {
+        "name": "Sportsbook Manager",
+        "emoji": "🎰",
+        "description": "Controls betting requests, markets, holds, voids, settlements, and sportsbook audits.",
+    },
+    "account": {
+        "name": "Discord Account Manager",
+        "emoji": "⌨️",
+        "description": "Manages fighter-to-Discord links and approved receipt-delivery support.",
+    },
 }
 
 OSBL_FIGHT_NIGHT_JOB_ALIASES = {
@@ -2288,6 +2303,14 @@ OSBL_FIGHT_NIGHT_JOB_ALIASES = {
     "media": "media",
     "poster": "media",
     "graphics": "media",
+    "sportsbook": "sportsbook",
+    "book": "sportsbook",
+    "betting": "sportsbook",
+    "bets": "sportsbook",
+    "account": "account",
+    "accounts": "account",
+    "discord": "account",
+    "linking": "account",
 }
 
 def _normalize_fight_night_job(raw_job):
@@ -2826,15 +2849,68 @@ OSBL_JOB_COMMAND_GUIDES = {
             "!rerenderfightcard <Booking ID>",
             "!fightposter <Booking ID>",
             "!fightposterall",
+            "!setfighterphoto Fighter Name",
             "!fighterphoto Fighter Name",
         ],
         "restrictions": [
             "Do not book, lock, or cancel fights.",
             "Do not enter results or alter rankings/RP.",
             "Do not process fighter payouts or treasury actions.",
-            "Do not modify fighter records, merge fighters, or use cleanup/admin commands.",
+            "Permanent fighter-photo removal remains Commissioner-only.",
         ],
         "escalate": "Matchmaker / Fight Night Supervisor",
+    },
+    "sportsbook": {
+        "title": "Sportsbook Manager",
+        "emoji": "🎰",
+        "mission": "Control OSBL betting requests and fight markets without interfering with official fight decisions.",
+        "responsibilities": [
+            "Review and process valid betting deposits and withdrawals.",
+            "Open and lock approved fight markets.",
+            "Hold or void markets when the official fight status requires it.",
+            "Settle only after the official result is verified and no ruling is pending.",
+        ],
+        "commands": [
+            "!bettingrequests",
+            "!confirmbetdeposit <Request ID>",
+            "!confirmbetwithdraw <Request ID>",
+            "!rejectbetrequest <Request ID> reason",
+            "!openbetting <Booking ID>",
+            "!lockbets <Booking ID>",
+            "!holdbets <Booking ID> reason",
+            "!voidbets <Booking ID> reason",
+            "!settlebets <Booking ID>",
+            "!bettingaudit",
+        ],
+        "restrictions": [
+            "Do not decide fight outcomes.",
+            "Do not settle a disputed or under-review fight.",
+            "Do not bypass own-fight betting restrictions.",
+            "Do not process fighter purses through sportsbook commands.",
+        ],
+        "escalate": "Fight Night Supervisor / OSBL Commissioner",
+    },
+    "account": {
+        "title": "Discord Account Manager",
+        "emoji": "⌨️",
+        "mission": "Maintain accurate fighter-to-Discord identity links and approved receipt delivery support.",
+        "responsibilities": [
+            "Verify the fighter and Discord member before linking.",
+            "Correct or remove incorrect links when authorized.",
+            "Resend receipts only after confirming the correct fighter/account connection.",
+        ],
+        "commands": [
+            "!linkfighterdiscord Fighter Name | @DiscordUser",
+            "!fighterdiscord Fighter Name",
+            "!unlinkfighterdiscord Fighter Name",
+            "!resendreceipt <Cashout ID>",
+        ],
+        "restrictions": [
+            "Do not change fight records, RP, rankings, or gyms.",
+            "Do not merge duplicate fighter records.",
+            "Do not send receipts to an unverified account.",
+        ],
+        "escalate": "OSBL Commissioner",
     },
 }
 
@@ -5238,6 +5314,48 @@ async def fightnightrecap(ctx, session_id: int = None):
 
 
 # =========================================================
+# PROMOTER / MEDIA PHOTO AUTHORIZATION
+# Promoters may update approved portraits only for fighters in their own gym.
+# League Media may update portraits league-wide; Commissioner always overrides.
+# =========================================================
+
+async def _promoter_gym_for_user(user_id):
+    row = await bot.db.fetchrow(
+        """
+        SELECT official_name
+        FROM gym_settings
+        WHERE promoter_discord_user_id = $1
+        LIMIT 1
+        """,
+        int(user_id),
+    )
+    return row["official_name"] if row else None
+
+
+async def _can_manage_fighter_photo(ctx, fighter_gym):
+    if _member_has_role_name(ctx.author, "OSBL COMMISSIONER"):
+        return True, "commissioner"
+
+    promoter_gym = await _promoter_gym_for_user(ctx.author.id)
+    official_fighter_gym = _resolve_official_gym(fighter_gym)
+    if promoter_gym and official_fighter_gym and promoter_gym == official_fighter_gym:
+        return True, "promoter"
+
+    if _member_has_role_name(ctx.author, "OSBL OFFICIAL"):
+        try:
+            await _job_permission_check(
+                ctx,
+                ("media",),
+                allow_official_without_session=True,
+            )
+            return True, "media"
+        except commands.CheckFailure:
+            pass
+
+    return False, None
+
+
+# =========================================================
 # FIGHTER PHOTO REGISTRY
 # Permanent portrait storage in PostgreSQL
 # =========================================================
@@ -5247,7 +5365,6 @@ MAX_FIGHTER_PHOTO_BYTES = 4 * 1024 * 1024
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER")
 async def setfighterphoto(ctx, *, fighter_name: str = None):
     if not fighter_name:
         await ctx.send(
@@ -5278,11 +5395,27 @@ async def setfighterphoto(ctx, *, fighter_name: str = None):
 
     fighter_key = fighter_name.casefold().strip()
     fighter = await bot.db.fetchrow(
-        "SELECT fighter_name FROM fighters WHERE fighter_key = $1",
+        "SELECT fighter_name, gym FROM fighters WHERE fighter_key = $1",
         fighter_key,
     )
     if not fighter:
         await ctx.send(f"❌ **{fighter_name}** is not registered in OSBL.")
+        return
+
+    authorized, access_type = await _can_manage_fighter_photo(ctx, fighter["gym"])
+    if not authorized:
+        promoter_gym = await _promoter_gym_for_user(ctx.author.id)
+        if promoter_gym:
+            await ctx.send(
+                "⛔ **PROMOTER PHOTO RESTRICTION**\n"
+                f"You are linked to **{promoter_gym}** and may only update fighters on that gym's official roster."
+            )
+        else:
+            await ctx.send(
+                "⛔ **OSBL PHOTO AUTHORIZATION REQUIRED**\n"
+                "This command is limited to the Commissioner, assigned League Media, "
+                "or the verified promoter of the fighter's own gym."
+            )
         return
 
     try:
@@ -5324,6 +5457,15 @@ async def setfighterphoto(ctx, *, fighter_name: str = None):
     )
     embed.add_field(name="Locked By", value=ctx.author.display_name, inline=False)
     embed.add_field(
+        name="Authorization",
+        value=(
+            "OSBL Commissioner" if access_type == "commissioner" else
+            "League Media" if access_type == "media" else
+            f"Verified {fighter['gym']} Promoter"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Fight Card",
         value="This portrait is used automatically by `!fightcard`, `!fightcardposter`, and locked-matchup poster generation.",
         inline=False,
@@ -5333,7 +5475,6 @@ async def setfighterphoto(ctx, *, fighter_name: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
 async def fighterphoto(ctx, *, fighter_name: str = None):
     if not fighter_name:
         await ctx.send("❌ Use `!fighterphoto Fighter Name`")
@@ -6720,6 +6861,85 @@ async def removegym(ctx, *, fighter_name: str = None):
     embed.add_field(name="Previous Gym", value=old_gym, inline=False)
     embed.set_footer(text=f"{GYM_MANAGEMENT_VERSION} • Updated by {ctx.author.display_name}")
     await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_any_role("OSBL COMMISSIONER")
+async def linkpromoterdiscord(ctx, *, details: str = None):
+    """Link one official gym promoter to their Discord account for own-gym permissions."""
+    if not details or "|" not in details:
+        await ctx.send(
+            "❌ **PROMOTER DISCORD LINK FORMAT**\n"
+            "`!linkpromoterdiscord Gym Name | @DiscordUser`"
+        )
+        return
+
+    gym_name, raw_member = [part.strip() for part in details.split("|", 1)]
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+
+    member, resolve_error = await _resolve_staff_member(ctx, raw_member)
+    if resolve_error == "ambiguous":
+        await ctx.send("⚠️ More than one member matches that name. Use an exact username or mention.")
+        return
+    if member is None:
+        await ctx.send(f"❌ I couldn't find Discord member **{raw_member}**.")
+        return
+
+    existing = await bot.db.fetchrow(
+        "SELECT official_name FROM gym_settings WHERE promoter_discord_user_id = $1 AND official_name <> $2",
+        member.id, official,
+    )
+    if existing:
+        await ctx.send(
+            f"⛔ **{member.display_name}** is already linked as promoter for **{existing['official_name']}**. "
+            "Unlink or change that assignment first."
+        )
+        return
+
+    await bot.db.execute(
+        """
+        UPDATE gym_settings
+        SET promoter_discord_user_id = $1,
+            promoter_discord_display_name = $2,
+            updated_by_id = $3,
+            updated_by_name = $4,
+            updated_at = NOW()
+        WHERE official_name = $5
+        """,
+        member.id, member.display_name, ctx.author.id, ctx.author.display_name, official,
+    )
+    await ctx.send(
+        "✅ **OSBL PROMOTER DISCORD LINKED**\n"
+        f"Gym: **{official}**\n"
+        f"Promoter Discord: **{member.display_name}**\n"
+        "They may now use `!setfighterphoto` only for fighters officially assigned to this gym."
+    )
+
+
+@bot.command()
+async def promoterdiscord(ctx, *, gym_name: str = None):
+    if not gym_name:
+        await ctx.send("❌ Use: `!promoterdiscord Gym Name`")
+        return
+    official = _resolve_official_gym(gym_name)
+    if not official:
+        await ctx.send(_gym_usage())
+        return
+    row = await bot.db.fetchrow(
+        "SELECT promoter_name, promoter_discord_user_id, promoter_discord_display_name FROM gym_settings WHERE official_name = $1",
+        official,
+    )
+    if not row or not row["promoter_discord_user_id"]:
+        await ctx.send(f"ℹ️ **{official}** does not have a Discord promoter account linked yet.")
+        return
+    await ctx.send(
+        f"🎙️ **{official} PROMOTER LINK**\n"
+        f"Promoter: **{row['promoter_name']}**\n"
+        f"Discord: **{row['promoter_discord_display_name'] or row['promoter_discord_user_id']}**"
+    )
 
 
 @bot.command()
@@ -9526,7 +9746,7 @@ async def _send_payout_receipt_to_fighter(cashout_id):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("account", allow_official_without_session=True)
 async def linkfighterdiscord(ctx, *, link_text: str = None):
     """
     Link one OSBL fighter to one Discord account.
@@ -9657,7 +9877,7 @@ async def fighterdiscord(ctx, *, fighter_name: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("account", allow_official_without_session=True)
 async def unlinkfighterdiscord(ctx, *, fighter_name: str = None):
     fighter_name = " ".join(str(fighter_name or "").strip().split())
     if not fighter_name:
@@ -9681,7 +9901,7 @@ async def unlinkfighterdiscord(ctx, *, fighter_name: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("account", allow_official_without_session=True)
 async def resendreceipt(ctx, cashout_id: int = None):
     if cashout_id is None:
         await ctx.send("❌ Use: `!resendreceipt <Cashout ID>`")
@@ -11555,7 +11775,7 @@ async def betwithdraw(ctx, amount: str = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", "supervisor", allow_official_without_session=True)
 async def bettingrequests(ctx):
     async with bot.db.acquire() as conn:
         rows = await conn.fetch(
@@ -11579,7 +11799,7 @@ async def bettingrequests(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def confirmbetdeposit(ctx, request_id: int = None):
     if request_id is None:
         await ctx.send("❌ Use: `!confirmbetdeposit <Request ID>`")
@@ -11644,7 +11864,7 @@ async def confirmbetdeposit(ctx, request_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def confirmbetwithdraw(ctx, request_id: int = None):
     if request_id is None:
         await ctx.send("❌ Use: `!confirmbetwithdraw <Request ID>`")
@@ -11706,7 +11926,7 @@ async def confirmbetwithdraw(ctx, request_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def rejectbetrequest(ctx, request_id: int = None, *, reason: str = "Not approved"):
     if request_id is None:
         await ctx.send("❌ Use: `!rejectbetrequest <Request ID> [reason]`")
@@ -11760,7 +11980,7 @@ async def rejectbetrequest(ctx, request_id: int = None, *, reason: str = "Not ap
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def openbetting(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use: `!openbetting <Booking ID>`")
@@ -12067,7 +12287,7 @@ async def mybets(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def lockbets(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use: `!lockbets <Booking ID>`")
@@ -12098,7 +12318,7 @@ async def lockbets(ctx, booking_id: int = None):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def holdbets(ctx, booking_id: int = None, *, reason: str = "Official review"):
     if booking_id is None:
         await ctx.send("❌ Use: `!holdbets <Booking ID> [reason]`")
@@ -12128,7 +12348,7 @@ async def holdbets(ctx, booking_id: int = None, *, reason: str = "Official revie
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def voidbets(ctx, booking_id: int = None, *, reason: str = "Fight voided / canceled"):
     if booking_id is None:
         await ctx.send("❌ Use: `!voidbets <Booking ID> [reason]`")
@@ -12167,7 +12387,7 @@ async def voidbets(ctx, booking_id: int = None, *, reason: str = "Fight voided /
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", allow_official_without_session=True)
 async def settlebets(ctx, booking_id: int = None):
     if booking_id is None:
         await ctx.send("❌ Use: `!settlebets <Booking ID>`")
@@ -12557,7 +12777,7 @@ async def bettingboard(ctx):
 
 
 @bot.command()
-@commands.has_any_role("OSBL COMMISSIONER", "OSBL OFFICIAL")
+@fightnight_jobs_required("sportsbook", "supervisor", allow_official_without_session=True)
 async def bettingaudit(ctx, limit: int = 20):
     limit=max(1,min(int(limit or 20),40))
     async with bot.db.acquire() as conn:
